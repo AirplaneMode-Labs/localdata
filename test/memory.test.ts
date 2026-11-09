@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createStore } from '../src/index';
+import { runQuerySuite } from './query.behaviour';
 import { behaviourCases, runSuite, type MakeStore } from './storage.behaviour';
 
 const makeStore: MakeStore = (opts) => createStore({ driver: 'memory', ...(opts ?? {}) });
@@ -11,6 +12,10 @@ describe('behavioural suite (memory driver)', () => {
   });
 
   runSuite(makeStore, it);
+});
+
+describe('query() suite (memory driver)', () => {
+  runQuerySuite(makeStore, it, it.skip);
 });
 
 describe('createStore', () => {
