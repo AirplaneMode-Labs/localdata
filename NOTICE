@@ -1,0 +1,9 @@
+Airplane Mode Labs localdata
+Copyright 2026 Tushar (jtushar53@gmail.com)
+
+This product includes software developed at Airplane Mode Labs (https://github.com/AirplaneMode-Labs).
+
+Third-party notices
+-------------------
+This package has no runtime dependencies. Development-only tooling (TypeScript, tsup, Vitest,
+Prettier, Playwright) is used under its own licence and is not redistributed in the published package.
