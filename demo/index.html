@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>localdata demo</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>localdata demo</h1>
+      <p class="lede">
+        Everything runs in this tab. Nothing is uploaded; the only network requests are for this
+        page's own files.
+      </p>
+      <p class="status-line">
+        Built from main at <code id="build-sha">__BUILD_SHA__</code> by
+        <code>.github/workflows/pages.yml</code>
+      </p>
+    </header>
+
+    <main>
+      <section id="requirements" class="box">
+        <h2>Browser requirements</h2>
+        <ul id="req-list" class="req-list">
+          <li data-req="opfs">
+            <span class="mark" aria-hidden="true">?</span>
+            <span class="req-text"
+              >OPFS (<code>navigator.storage.getDirectory</code>, Chrome/Edge 86+, secure
+              context)</span
+            >
+          </li>
+          <li data-req="indexeddb">
+            <span class="mark" aria-hidden="true">?</span>
+            <span class="req-text">IndexedDB</span>
+          </li>
+          <li data-req="estimate">
+            <span class="mark" aria-hidden="true">?</span>
+            <span class="req-text"><code>navigator.storage.estimate()</code></span>
+          </li>
+          <li data-req="persist">
+            <span class="mark" aria-hidden="true">?</span>
+            <span class="req-text"><code>navigator.storage.persist()</code></span>
+          </li>
+        </ul>
+        <!-- prettier-ignore -->
+        <p class="shared-origin">All Airplane Mode Labs demos share one browser origin (airplanemode-labs.github.io): storage, quota, estimate() and persist() are shared between them. This demo writes only under airplanemode-localdata (namespace demo-fill for the quota fill).</p>
+      </section>
+
+      <section id="not-yet" class="box box-warn">
+        <h2>What this demo does not do yet</h2>
+        <ul>
+          <li>
+            <code>query()</code> rejects with <code>StorageError</code> code
+            <code>not_implemented</code>; the vector index lands in Sprint 4.
+          </li>
+          <li>There is no vector index and no similarity search of any kind (Sprint 4).</li>
+          <li>
+            No cross-tab coordination: two tabs writing the same namespace can leave the accounting
+            record stale until the next read repairs it.
+          </li>
+          <li>
+            Chrome under-reports IndexedDB usage in <code>estimate()</code>, so the browser figure
+            and the SDK figure will not match on the indexeddb driver.
+          </li>
+          <li>
+            <code>persist()</code> may be refused without user engagement with the site; a refusal
+            is shown as <code>false</code>, not as an error.
+          </li>
+          <li>
+            No service worker: offline after the first load is best effort (Chrome's HTTP cache),
+            not guaranteed.
+          </li>
+        </ul>
+      </section>
+
+      <section id="store" class="box">
+        <h2>Store</h2>
+        <div class="row">
+          <label for="driver">Driver</label>
+          <select id="driver">
+            <option value="opfs">opfs</option>
+            <option value="indexeddb">indexeddb</option>
+            <option value="memory">memory</option>
+          </select>
+          <label for="quota">SDK soft quota (bytes, optional)</label>
+          <input id="quota" type="number" min="0" step="1" placeholder="e.g. 67108864" />
+          <button id="open" type="button">Open store</button>
+          <button id="close" type="button" disabled>Close store</button>
+        </div>
+        <p id="store-status" class="muted">No store open.</p>
+      </section>
+
+      <section id="kv" class="box">
+        <h2>set / get / delete</h2>
+        <div class="row">
+          <label for="ns">Namespace</label>
+          <input id="ns" type="text" value="docs" spellcheck="false" />
+          <label for="key">Key</label>
+          <input id="key" type="text" value="k1" spellcheck="false" />
+        </div>
+        <label for="value">Value (JSON, or a plain string when it does not parse as JSON)</label>
+        <textarea id="value" rows="3" spellcheck="false">{"a":1}</textarea>
+        <div class="row">
+          <label class="check"
+            ><input id="binary" type="checkbox" /> binary 1 MiB (store a Uint8Array pattern instead
+            of the value above)</label
+          >
+        </div>
+        <div class="row">
+          <button id="set" type="button">Set</button>
+          <button id="get" type="button">Get</button>
+          <button id="delete" type="button">Delete</button>
+          <button id="list" type="button">List</button>
+          <button id="usage" type="button">Usage</button>
+        </div>
+        <pre id="kv-out" class="out" aria-live="polite">Open a store first.</pre>
+      </section>
+
+      <section id="storage-panel" class="box">
+        <h2>navigator.storage (live, refreshed every 2 s and after each action)</h2>
+        <table class="kv-table">
+          <tbody>
+            <tr>
+              <th scope="row">estimate().usage</th>
+              <td id="est-usage">-</td>
+            </tr>
+            <tr>
+              <th scope="row">estimate().quota</th>
+              <td id="est-quota">-</td>
+            </tr>
+            <tr>
+              <th scope="row">usage / quota</th>
+              <td id="est-pct">-</td>
+            </tr>
+            <tr>
+              <th scope="row">persisted()</th>
+              <td id="persisted">-</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row">
+          <button id="persist" type="button">Request persist()</button>
+          <span id="persist-result" class="muted"></span>
+        </div>
+      </section>
+
+      <section id="query" class="box">
+        <h2>query(): not implemented (Sprint 4)</h2>
+        <p>
+          Calls <code>store.query(ns, new Float32Array(4), 1)</code> and prints the error the SDK
+          throws, verbatim.
+        </p>
+        <div class="row">
+          <button id="query-btn" type="button">Call query()</button>
+        </div>
+        <pre id="query-out" class="out" aria-live="polite"></pre>
+      </section>
+
+      <section id="fill" class="box">
+        <h2>Quota fill</h2>
+        <p>
+          Writes 4 MiB chunks of random bytes (<code>crypto.getRandomValues</code>, synthetic) as
+          keys <code>fill-000001</code>, <code>fill-000002</code>, ... under namespace
+          <code>demo-fill</code> until the SDK soft quota or the browser reports
+          <code>quota_exceeded</code>, Stop is pressed, or the ceiling is reached.
+        </p>
+        <!-- prettier-ignore -->
+        <p id="ceiling" class="muted">Hard ceiling 512 MiB per run; this consumes quota the runtime demo also uses; use Clear fill afterwards</p>
+        <div class="row">
+          <button id="fill-start" type="button">Start fill</button>
+          <button id="fill-stop" type="button" disabled>Stop</button>
+          <button id="fill-clear" type="button">Clear fill</button>
+        </div>
+        <p id="fill-progress" class="mono"></p>
+        <pre id="fill-out" class="out" aria-live="polite"></pre>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        <a href="https://github.com/AirplaneMode-Labs/localdata">localdata on GitHub</a> ·
+        <a href="https://airplanemode-labs.github.io/site/">Airplane Mode Labs</a> · Apache-2.0
+      </p>
+    </footer>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -41,9 +41,10 @@
   "scripts": {
     "build": "tsup",
     "build:harness": "node test/browser/serve.mjs --build-only",
+    "demo:build": "node demo/build.mjs",
     "test": "vitest run",
     "test:browser": "playwright test -c test/browser/playwright.config.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p demo/tsconfig.json",
     "fmt": "prettier --write .",
     "fmt:check": "prettier --check .",
     "deps:scripts": "npm query ':attr(scripts,[postinstall]),:attr(scripts,[preinstall])'",
