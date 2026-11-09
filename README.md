@@ -13,6 +13,22 @@ IndexedDB, in-memory) and passes one shared behavioural suite in Node and in Chr
 frozen signature that rejects with `not_implemented` until the vector index lands in Sprint 4. No
 release has been tagged.
 
+## Demo
+
+Live demo: <https://airplanemode-labs.github.io/localdata/>. Built from `main` by
+`.github/workflows/pages.yml` on every push; it shows only what works today and has a box titled
+"What this demo does not do yet". It runs entirely in the browser: no upload, no analytics, no
+third-party scripts or fonts.
+
+The page lets you pick a driver (OPFS, IndexedDB or memory), open a store with an optional SDK soft
+quota, `set`/`get`/`delete`/`list` values by namespace and key (JSON, plain strings or a 1 MiB
+binary pattern), watch `navigator.storage.estimate()` and `persisted()` live, request `persist()`,
+call `query()` to see the `not_implemented` error verbatim, and fill quota with synthetic 4 MiB
+chunks under the namespace `demo-fill` until the SDK soft quota or the browser refuses the write.
+It writes only under localdata's own OPFS directory and IndexedDB database
+(`airplanemode-localdata`). `npm run demo:build` produces the same `demo/dist/` the workflow
+deploys; nothing built is committed.
+
 ## Install
 
 Not published yet. From a checkout:
@@ -149,6 +165,7 @@ for the disclosure policy.
 npm ci                   # install scripts are disabled (.npmrc ignore-scripts=true)
 npm run ci               # fmt:check, typecheck, vitest (memory driver + codec), build
 npm run test:browser     # Playwright on installed Chrome (channel "chrome"); builds test/browser/dist
+npm run demo:build       # bundle the public demo into demo/dist (what .github/workflows/pages.yml deploys)
 npm run sync-contracts   # refresh src/contracts from ../runtime/spec
 npm run deps:scripts     # list dev dependencies that declare install scripts
 npm pack --dry-run       # dist, LICENSE, NOTICE, README.md, package.json

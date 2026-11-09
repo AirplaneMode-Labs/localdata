@@ -23,6 +23,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `keys.json` index) and IndexedDB (database `airplanemode-localdata`, store `kv`).
 - `query()` signature frozen; it rejects with `StorageError` code `not_implemented` until the
   vector index lands in Sprint 4.
+- Public demo at <https://airplanemode-labs.github.io/localdata/> (`demo/`, bundled by
+  `demo/build.mjs` with tsup, deployed by `.github/workflows/pages.yml`, built again in CI): driver
+  picker, set/get/delete/list/usage, live `navigator.storage.estimate()` and `persist()`, the
+  `query()` `not_implemented` error shown verbatim, and a quota fill under namespace `demo-fill`.
+  No network requests; strict CSP meta; writes only under `airplanemode-localdata`.
 
 ### Fixed
 
