@@ -1,0 +1,61 @@
+{
+  "name": "@airplanemode/localdata",
+  "version": "0.1.0-dev",
+  "description": "Offline-first browser storage SDK: set/get/delete/query over OPFS with an IndexedDB fallback.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AirplaneMode-Labs/localdata"
+  },
+  "homepage": "https://github.com/AirplaneMode-Labs/localdata",
+  "bugs": {
+    "url": "https://github.com/AirplaneMode-Labs/localdata/issues"
+  },
+  "keywords": [
+    "opfs",
+    "indexeddb",
+    "offline-first",
+    "storage",
+    "browser"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:harness": "node test/browser/serve.mjs --build-only",
+    "test": "vitest run",
+    "test:browser": "playwright test -c test/browser/playwright.config.ts",
+    "typecheck": "tsc --noEmit",
+    "fmt": "prettier --write .",
+    "fmt:check": "prettier --check .",
+    "deps:scripts": "npm query ':attr(scripts,[postinstall]),:attr(scripts,[preinstall])'",
+    "sync-contracts": "node scripts/sync-contracts.mjs",
+    "ci": "npm run fmt:check && npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "playwright": "1.65.0",
+    "prettier": "3.9.10",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  }
+}
