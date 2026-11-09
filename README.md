@@ -6,29 +6,6 @@ implementing the Airplane Mode Labs Storage API contract.
 Package names use the placeholder scope `@airplanemode` / crate names `<repo>` until the handles are
 reserved; nothing is published yet.
 
-## Status
-
-Alpha skeleton (Sprint 1, `0.1.0-dev`). The key-value surface works against three drivers (OPFS,
-IndexedDB, in-memory) and passes one shared behavioural suite in Node and in Chrome. `query()` is a
-frozen signature that rejects with `not_implemented` until the vector index lands in Sprint 4. No
-release has been tagged.
-
-## Demo
-
-Live demo: <https://airplanemode-labs.github.io/localdata/>. Built from `main` by
-`.github/workflows/pages.yml` on every push; it shows only what works today and has a box titled
-"What this demo does not do yet". It runs entirely in the browser: no upload, no analytics, no
-third-party scripts or fonts.
-
-The page lets you pick a driver (OPFS, IndexedDB or memory), open a store with an optional SDK soft
-quota, `set`/`get`/`delete`/`list` values by namespace and key (JSON, plain strings or a 1 MiB
-binary pattern), watch `navigator.storage.estimate()` and `persisted()` live, request `persist()`,
-call `query()` to see the `not_implemented` error verbatim, and fill quota with synthetic 4 MiB
-chunks under the namespace `demo-fill` until the SDK soft quota or the browser refuses the write.
-It writes only under localdata's own OPFS directory and IndexedDB database
-(`airplanemode-localdata`). `npm run demo:build` produces the same `demo/dist/` the workflow
-deploys; nothing built is committed.
-
 ## Install
 
 Not published yet. From a checkout:
@@ -104,13 +81,36 @@ Implements Storage API `0.1.0` from `AirplaneMode-Labs/runtime` `spec/storage-ap
 here: `npm run sync-contracts` copies it from the sibling `../runtime/spec` checkout and
 `test/contracts-sync.test.ts` fails on drift (and skips when the sibling is absent).
 
+## Demo
+
+Live demo: <https://airplanemode-labs.github.io/localdata/>. Built from `main` by
+`.github/workflows/pages.yml` on every push; it shows only what works today and has a box titled
+"What this demo does not do yet". It runs entirely in the browser: no upload, no analytics, no
+third-party scripts or fonts.
+
+The page lets you pick a driver (OPFS, IndexedDB or memory), open a store with an optional SDK soft
+quota, `set`/`get`/`delete`/`list` values by namespace and key (JSON, plain strings or a 1 MiB
+binary pattern), watch `navigator.storage.estimate()` and `persisted()` live, request `persist()`,
+call `query()` to see the `not_implemented` error verbatim, and fill quota with synthetic 4 MiB
+chunks under the namespace `demo-fill` until the SDK soft quota or the browser refuses the write.
+It writes only under localdata's own OPFS directory and IndexedDB database
+(`airplanemode-localdata`). `npm run demo:build` produces the same `demo/dist/` the workflow
+deploys; nothing built is committed.
+
+## Status
+
+Alpha skeleton (Sprint 1, `0.1.0-dev`; Sprint 2 added only the skipped `query()` test suite and the design note, no feature change). The key-value surface works against three drivers (OPFS,
+IndexedDB, in-memory) and passes one shared behavioural suite in Node and in Chrome. `query()` is a
+frozen signature that rejects with `not_implemented` until the vector index lands in Sprint 4. No
+release has been tagged.
+
 ## Benchmarks
 
 Produced on the development machine by
-`LOCALDATA_BENCH_OUT=/private/tmp/airplanemode-team/D4/bench npm run test:browser` (the two
+`LOCALDATA_BENCH_OUT=evidence/sprint-1/D4/bench npm run test:browser` (the two
 `benchmark:` cases in `test/browser/drivers.spec.ts`) with Chrome 157.0.8103.38, Playwright channel
 `chrome`, headless. The figures below are the `raw.log` lines stamped `2026-11-09T04:20:16.078Z`
-(opfs) and `2026-11-09T04:20:16.527Z` (indexeddb) in `/private/tmp/airplanemode-team/D4/bench/raw.log`;
+(opfs) and `2026-11-09T04:20:16.527Z` (indexeddb) in `evidence/sprint-1/D4/bench/raw.log`;
 later runs appended to the same log are not quoted here. When
 `LOCALDATA_BENCH_OUT` is unset the benchmark cases still run but write nothing. Each `set` includes
 codec, accounting record rewrite and the driver write.
@@ -131,7 +131,9 @@ a claim about the target laptop.
 ## Limitations
 
 - `query()` is not implemented until Sprint 4; there is no vector index. The call rejects with
-  `StorageError` code `not_implemented`.
+  `StorageError` code `not_implemented`. The flat-index and HNSW design, the OPFS layout and the
+  under-2-second cold-load target (not measured) are in [docs/vector-index.md](docs/vector-index.md);
+  its 13 query test cases are written and skipped until Sprint 4.
 - OPFS requires Chrome (or another Chromium with the File System Access origin private file system)
   and a secure context (`https:` or `127.0.0.1`/`localhost`). Firefox and Safari are untested.
 - The IndexedDB fallback stores whole values, not chunks; a value is held in memory in full during
@@ -161,6 +163,8 @@ for the disclosure policy.
 
 ## Develop
 
+Vitest is pinned at 4.1.12. With npm 10.9.8, adding or upgrading a package reports a peer-dependency conflict, so run `npm install --legacy-peer-deps` for that one command. `npm ci` from the committed lockfile needs no flag. We revisit this when vitest's peer range is updated.
+
 ```sh
 npm ci                   # install scripts are disabled (.npmrc ignore-scripts=true)
 npm run ci               # fmt:check, typecheck, vitest (memory driver + codec), build
@@ -171,8 +175,9 @@ npm run deps:scripts     # list dev dependencies that declare install scripts
 npm pack --dry-run       # dist, LICENSE, NOTICE, README.md, package.json
 ```
 
-On Linux CI the browser job runs `npx playwright install --with-deps chrome` first. Locally the
-installed Chrome is used and nothing is downloaded. Tests are written before implementation: the
+On Linux CI the browser job checks the runner's preinstalled Google Chrome with `google-chrome
+--version` and fails if it is missing (configured, not yet executed); nothing is installed or
+downloaded. Locally the installed Chrome is used. Tests are written before implementation: the
 shared behavioural suite lives in `test/storage.behaviour.ts` and runs in Vitest
 (`test/memory.test.ts`) and in Chrome (`test/browser/harness.ts`).
 
