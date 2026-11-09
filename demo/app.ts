@@ -20,6 +20,12 @@ const FILL_CHUNK_BYTES = 4 * 1024 * 1024;
 const FILL_CEILING_BYTES = 512 * 1024 * 1024;
 const BINARY_BYTES = 1024 * 1024;
 
+{
+  const node = document.getElementById('build-sha');
+  const sha = node?.getAttribute('data-sha') ?? '';
+  if (node) node.textContent = /^([0-9a-f]{12}|local)$/.test(sha) ? sha : 'local';
+}
+
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
   if (!node) throw new Error(`missing element #${id}`);

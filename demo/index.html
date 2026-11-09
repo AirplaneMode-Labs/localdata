@@ -19,7 +19,7 @@
         page's own files.
       </p>
       <p class="status-line">
-        Built from main at <code id="build-sha">__BUILD_SHA__</code> by
+        Built from main at <code id="build-sha" data-sha="__BUILD_SHA__">local</code> by
         <code>.github/workflows/pages.yml</code>
       </p>
     </header>
@@ -57,7 +57,10 @@
         <ul>
           <li>
             <code>query()</code> rejects with <code>StorageError</code> code
-            <code>not_implemented</code>; the vector index lands in Sprint 4.
+            <code>not_implemented</code>; the vector index lands in Sprint 4 (design note:
+            <a href="https://github.com/AirplaneMode-Labs/localdata/blob/main/docs/vector-index.md"
+              >docs/vector-index.md</a
+            >).
           </li>
           <li>There is no vector index and no similarity search of any kind (Sprint 4).</li>
           <li>
