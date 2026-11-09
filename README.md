@@ -176,7 +176,7 @@ npm pack --dry-run       # dist, LICENSE, NOTICE, README.md, package.json
 ```
 
 On Linux CI the browser job checks the runner's preinstalled Google Chrome with `google-chrome
---version` and fails if it is missing (configured, not yet executed); nothing is installed or
+--version` and fails if it is missing (first ran on GitHub on 9 Nov 2026); nothing is installed or
 downloaded. Locally the installed Chrome is used. Tests are written before implementation: the
 shared behavioural suite lives in `test/storage.behaviour.ts` and runs in Vitest
 (`test/memory.test.ts`) and in Chrome (`test/browser/harness.ts`).

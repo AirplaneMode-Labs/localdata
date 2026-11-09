@@ -21,6 +21,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- README: the CI Chrome check first ran on GitHub on 9 Nov 2026; it is no longer called "configured, not yet
+  executed".
 - README: evidence citations point to `evidence/sprint-1/D4/`, Limitations links
   `docs/vector-index.md`, Develop carries the Vitest peer-dependency decision. (D4-04)
 - Contract re-sync check: Storage API 0.1.0 unchanged and in sync. (D4-01)
