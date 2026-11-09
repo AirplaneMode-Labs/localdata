@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>localdata browser harness</title>
+  </head>
+  <body>
+    <h1>localdata browser harness</h1>
+    <p>
+      Driven by Playwright through <code>window.__localdata</code>. Nothing here talks to the
+      network.
+    </p>
+    <pre id="log"></pre>
+    <script type="module" src="dist/harness.js"></script>
+  </body>
+</html>
