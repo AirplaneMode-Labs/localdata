@@ -20,6 +20,7 @@ export interface SpecLandedLocation {
 }
 export const DEFAULT_SPEC_DIR: string;
 export const DEFAULT_OUT_DIR: string;
+export const DEFAULT_EVIDENCE_ROOT: string;
 export const CONTRACT_VERSIONS: Record<string, string>;
 export const CONTRACT_FILES: string[];
 export const CONTRACTS: ContractEntry[];
@@ -29,7 +30,9 @@ export function parseLanded(text: string): Map<string, string>;
 export function findSpecLanded(opts?: {
   env?: Record<string, string | undefined>;
   repo?: string;
+  evidenceRoot?: string;
   exists?: (p: string) => boolean;
+  list?: (dir: string) => string[];
 }): SpecLandedLocation | undefined;
 export function sync(opts?: {
   specDir?: string;

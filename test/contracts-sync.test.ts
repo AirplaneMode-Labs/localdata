@@ -1,10 +1,20 @@
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   CONTRACTS,
+  CONTRACT_VERSIONS,
   findSpecLanded,
   parseLanded,
   sync,
@@ -43,17 +53,18 @@ function fixture(): { specDir: string; outDir: string; landed: Map<string, strin
 }
 
 describe('vendored contracts', () => {
-  it('vendor storage-api.ts @ 0.1.0 and event.ts @ 0.1.2, each with its own version header', () => {
+  it('vendor storage-api.ts @ 0.2.0 and event.ts @ 0.1.3, each with its own version header', () => {
+    expect(CONTRACT_VERSIONS).toEqual({ 'storage-api.ts': '0.2.0', 'event.ts': '0.1.3' });
     expect(CONTRACTS.map((c: { target: string }) => c.target.split(/[\\/]/).pop())).toEqual([
       'storage-api.ts',
       'event.ts',
     ]);
     const headers = (CONTRACTS as Array<{ header: string }>).map((c) => c.header);
     expect(headers[0]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.1.0; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.2.0; source of truth is runtime/spec; do not edit here\n',
     );
     expect(headers[1]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.2; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.3; source of truth is runtime/spec; do not edit here\n',
     );
   });
 
@@ -97,11 +108,11 @@ describe('sync() gated on SPEC-LANDED.txt', () => {
     const first = sync({ specDir, outDir, landed });
     expect(first.map((r: { status: string }) => r.status)).toEqual(['updated', 'updated']);
     expect(readFileSync(join(outDir, 'storage-api.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.1.0; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.2.0; source of truth is runtime/spec; do not edit here\n' +
         STORAGE_SRC,
     );
     expect(readFileSync(join(outDir, 'event.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.2; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.3; source of truth is runtime/spec; do not edit here\n' +
         EVENT_SRC,
     );
     const second = sync({ specDir, outDir, landed });
@@ -171,43 +182,128 @@ describe('sync() gated on SPEC-LANDED.txt', () => {
 
 describe('findSpecLanded lookup order', () => {
   const repo = join('x', 'localdata');
-  const evidence = join(repo, '..', 'evidence', 'sprint-3', 'D1', 'SPEC-LANDED.txt');
-  const exists = (present: string[]) => (p: string) => present.map((x) => resolve(x)).includes(p);
+  const evidenceDir = (n: number) =>
+    resolve(repo, '..', 'evidence', `sprint-${n}`, 'D1', 'SPEC-LANDED.txt');
+  const present = (paths: string[]) => (p: string) => paths.includes(p);
+  const listing = (sprints: string[]) => (dir: string) =>
+    dir === resolve(repo, '..', 'evidence') ? sprints : [];
 
   it('1. env SPEC_LANDED wins when it names an existing file', () => {
     const r = findSpecLanded({
       env: { SPEC_LANDED: '/elsewhere/SPEC-LANDED.txt' },
       repo,
-      exists: exists(['/elsewhere/SPEC-LANDED.txt', evidence]),
+      exists: present([resolve('/elsewhere/SPEC-LANDED.txt'), evidenceDir(3)]),
+      list: listing(['sprint-3']),
     });
-    expect(r).toEqual({ path: '/elsewhere/SPEC-LANDED.txt', source: 'env' });
+    expect(r).toEqual({ path: resolve('/elsewhere/SPEC-LANDED.txt'), source: 'env' });
   });
 
   it('an env SPEC_LANDED that names a missing file is an error, never a silent fall-through', () => {
     const r = findSpecLanded({
       env: { SPEC_LANDED: '/nope/SPEC-LANDED.txt' },
       repo,
-      exists: exists([evidence]),
+      exists: present([evidenceDir(3)]),
+      list: listing(['sprint-3']),
     });
-    expect(r).toEqual({ path: '/nope/SPEC-LANDED.txt', source: 'env', missing: true });
+    expect(r).toEqual({ path: resolve('/nope/SPEC-LANDED.txt'), source: 'env', missing: true });
   });
 
-  it('2. ../evidence/sprint-3/D1/SPEC-LANDED.txt next', () => {
-    const r = findSpecLanded({ env: {}, repo, exists: exists([evidence]) });
-    expect(r?.source).toBe('evidence');
-    expect(r?.path).toBe(resolve(evidence));
+  it('2. the highest-numbered evidence/sprint-<n>/D1/SPEC-LANDED.txt, compared as numbers', () => {
+    const r = findSpecLanded({
+      env: {},
+      repo,
+      exists: present([evidenceDir(3), evidenceDir(4), evidenceDir(10)]),
+      list: listing(['sprint-3', 'sprint-10', 'sprint-4', 'notes']),
+    });
+    expect(r).toEqual({ path: evidenceDir(10), source: 'evidence' });
   });
 
-  it('has no third lookup: a scratch-style path alone is not found', () => {
+  it('skips a sprint folder that has no D1/SPEC-LANDED.txt and takes the next highest', () => {
+    const r = findSpecLanded({
+      env: {},
+      repo,
+      exists: present([evidenceDir(3), evidenceDir(4)]),
+      list: listing(['sprint-3', 'sprint-4', 'sprint-5']),
+    });
+    expect(r).toEqual({ path: evidenceDir(4), source: 'evidence' });
+  });
+
+  it('ignores names that are not exactly sprint-<digits>', () => {
+    const r = findSpecLanded({
+      env: {},
+      repo,
+      exists: () => true,
+      list: listing(['sprint-', 'sprint-x', 'sprint-4a', 'Sprint-9', 'sprint-4']),
+    });
+    expect(r).toEqual({ path: evidenceDir(4), source: 'evidence' });
+  });
+
+  it('has no scratch lookup: a scratch-style path alone is not found', () => {
     const r = findSpecLanded({
       env: {},
       repo,
       exists: (p: string) => p.endsWith(join('D1', 'SPEC-LANDED.txt')) && !p.includes('evidence'),
+      list: listing([]),
     });
     expect(r).toBeUndefined();
   });
 
   it('returns undefined when none exists (the spec has not landed)', () => {
-    expect(findSpecLanded({ env: {}, repo, exists: () => false })).toBeUndefined();
+    expect(
+      findSpecLanded({ env: {}, repo, exists: () => false, list: listing(['sprint-3']) }),
+    ).toBeUndefined();
+  });
+});
+
+describe('sync-contracts command line', () => {
+  const script = resolve(import.meta.dirname, '..', 'scripts', 'sync-contracts.mjs');
+  const run = (args: string[], env: Record<string, string>) =>
+    spawnSync(process.execPath, [script, ...args], {
+      encoding: 'utf8',
+      env: { PATH: process.env['PATH'] ?? '', ...env },
+    });
+
+  it('exits 1 and copies nothing when no SPEC-LANDED.txt exists (none-found)', () => {
+    const specDir = tempDir('cli-spec');
+    const evidence = tempDir('cli-evidence');
+    mkdirSync(join(evidence, 'sprint-3'));
+    const r = run(['--spec-dir', specDir, '--evidence-root', evidence, '--check'], {});
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('SPEC-LANDED.txt not found');
+  });
+
+  it('with SPEC_LANDED naming a missing file exits 1 even when an evidence copy exists', () => {
+    const specDir = tempDir('cli-spec2');
+    const evidence = tempDir('cli-evidence2');
+    mkdirSync(join(evidence, 'sprint-4', 'D1'), { recursive: true });
+    writeFileSync(join(evidence, 'sprint-4', 'D1', 'SPEC-LANDED.txt'), '');
+    const r = run(['--spec-dir', specDir, '--evidence-root', evidence, '--check'], {
+      SPEC_LANDED: join(evidence, 'nope.txt'),
+    });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('SPEC-LANDED.txt not found');
+  });
+
+  it('with the highest sprint copy it finds the file and gates on its hashes', () => {
+    const specDir = tempDir('cli-spec3');
+    const evidence = tempDir('cli-evidence3');
+    writeFileSync(join(specDir, 'storage-api.ts'), STORAGE_SRC);
+    writeFileSync(join(specDir, 'event.ts'), EVENT_SRC);
+    mkdirSync(join(evidence, 'sprint-3', 'D1'), { recursive: true });
+    mkdirSync(join(evidence, 'sprint-4', 'D1'), { recursive: true });
+    // sprint-3 lists wrong hashes, sprint-4 the right ones: only the highest may be used.
+    writeFileSync(
+      join(evidence, 'sprint-3', 'D1', 'SPEC-LANDED.txt'),
+      `${'0'.repeat(64)}  storage-api.ts\n${'0'.repeat(64)}  event.ts\n`,
+    );
+    writeFileSync(
+      join(evidence, 'sprint-4', 'D1', 'SPEC-LANDED.txt'),
+      `${sha(STORAGE_SRC)}  storage-api.ts\n${sha(EVENT_SRC)}  event.ts\n`,
+    );
+    const r = run(['--spec-dir', specDir, '--evidence-root', evidence, '--check'], {});
+    // --check writes nothing: the vendored copies in this repo are not touched, drift is reported.
+    expect(r.stdout).toContain(join(evidence, 'sprint-4', 'D1', 'SPEC-LANDED.txt'));
+    expect(r.stdout).toContain('SPEC-LANDED.txt from evidence');
+    expect(r.stdout).not.toContain('sha-mismatch');
   });
 });
