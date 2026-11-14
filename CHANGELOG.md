@@ -7,10 +7,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Ids: `D4-0x` are Sprint 2 items; `S3-D4-0x` are Sprint 3 items. Tester and product-owner finding ids
-(`T3-S3-001`, `BUG-T1-S3-04`) are named where a line closes one.
+## [0.2.0-alpha.0] - 2026-11-14 (untagged)
+
+Nothing has ever been tagged or published, so everything since the first commit ships in this one
+version; the Sprint 4 items come first in each section. Ids: `D4-0x` are Sprint 4 items (plus a few
+Sprint 2 ones); `S3-D4-0x` are Sprint 3 items. Tester and product-owner finding ids (`T3-S3-001`,
+`BUG-T1-S3-04`) are named where a line closes one. Storage API 0.2.0 and Event 0.1.3 are vendored from
+spec release 0.4.0 in runtime/spec (committed; public after the owner's push).
 
 ### Added
+
+- A flat vector index, persisted beside the values: `putVectors(ns, rows)`, `query(ns, vector, k, opts)`
+  (cosine or dot, `filterPrefix`, `values`), `indexInfo(ns)`, `UsageResult.vectorRows` and `vectorBytes`,
+  `StorageError` code `corrupt`, and the `createStore` options `maxIndexBytes` and `vectorKernel`.
+  `query()` no longer throws `not_implemented`: the 13 `test/query.behaviour.ts` cases that were skipped
+  since Sprint 2 now run, unchanged except for a `put()` helper that calls `putVectors`. (D4-03)
+- `crates/ldvec`, a zero-dependency Rust crate compiled to two WebAssembly modules (SIMD and scalar,
+  each under 100 KB, path-remapped, embedded in `dist/index.js`): CRC-32C, validation of the on-disk
+  HEAD and META records with checked `u64` arithmetic, inverse norms, and a scan whose scores are
+  bit-identical between the two modules and to a `Math.fround` reference. `ldv_simd()` says which one
+  is running; the scalar build has no `0xFD` opcode and neither build has a relaxed-simd instruction
+  (decoded from the module bytes, not grepped). `npm run build:wasm`, `cargo test --locked` (a
+  200,000-iteration SplitMix64 mutation harness included), `clippy -D warnings`, `fmt --check`. (D4-02)
+- The on-disk format v1 with a versioned HEAD, CRC-32C on every part, tombstones and segments, written
+  crash-safely (parts first, HEAD last, new segments never overwrite a committed record) and read with
+  bounds (`maxIndexBytes` is checked before any allocation, memory grows only after a part has its
+  expected length). Documented in `docs/vector-index-format.md`; a golden fixture is written by the
+  TypeScript writer and parsed by the Rust crate. (D4-02, D4-03)
+- Cross-tab safety: the writer holds the Web Lock `airplanemode-localdata:vec:<ns>` from before the HEAD
+  re-read to after the HEAD put and drops the OPFS driver's cached `keys.json` first (the internal
+  `refreshIndex` hook; the `StorageDriver` contract is unchanged). Two pages writing the same namespace
+  and different namespaces at once, then a third page reopening, give every row, 0 `corrupt` and hits
+  bit-identical to the reference. (D4-03)
+- Events: `storage.query`, `storage.index.open` and `storage.index.write` (Event 0.1.3), never carrying a
+  key, `filterPrefix`, vector, score or value. (D4-03)
+- `bench/synth.ts` (deterministic synthetic vectors and chunks; no real documents, no model),
+  `npm run bench:vectors` (10k and 100k indexes at 256-byte and 2,048-byte chunks on OPFS, 10k and
+  100k on IndexedDB, 5 cold runs plus a browser relaunch each, precise JS heap, write time, query
+  p50 and p95) writing `docs/benchmarks/vector-index.csv` with a generated commit, machine and Chrome
+  version, and `scripts/bench-readme.mjs`, which writes the README Benchmarks block from the CSV and
+  nothing else (`test/readme-bench.test.ts` fails on any difference). (D4-04)
+- Demo: a Vector index section that builds 10,000 or 100,000 synthetic rows in the page, reloads, runs a
+  cold query and shows the measured time, kernel, memory and a match against the naive reference, with
+  a storage warning before the build and a Delete index button. The CSP gains only
+  `'wasm-unsafe-eval'` (pinned by `test/demo-csp.test.ts`). (D4-05)
+- `docs/release.md` with the definition-of-done rows, `docs/vector-index-format.md`, and
+  `scripts/pack-check.mjs` checks that the embedded modules equal a fresh remapped build, that no
+  builder path is in the tarball, and a fresh-directory install that writes three vectors and queries
+  them. (D4-05)
 
 - CI: `npm run pack:check` runs in the three-OS `check` job after `npm run ci`. The `npm.cmd` Windows branch of `pack-check` runs only on the owner's `windows-latest` CI read and has not been executed locally. (T3-S3-025)
 - `*.tgz` is git-ignored so `npm pack` from a clone leaves no untracked tarball. (T3-S3-024)
@@ -54,6 +98,32 @@ Ids: `D4-0x` are Sprint 2 items; `S3-D4-0x` are Sprint 3 items. Tester and produ
   `textContent`; not-yet box links the design note. (D4-04)
 
 ### Changed
+
+- `query()` is implemented: Storage API 0.2.0 (vendored from spec release 0.4.0, committed; public after
+  the owner's push) replaces 0.1.0, and Event 0.1.3 replaces 0.1.2. A `Float32Array` passed to `set()` is
+  still an ordinary value and is not indexed. The two tests that pinned 0.1.0 (`test/events.test.ts` and
+  `test/storage.behaviour.ts`: "query rejects with not_implemented") now assert the 0.2.0 behaviour.
+  (D4-01, D4-03)
+- `scripts/sync-contracts.mjs` looks for `SPEC-LANDED.txt` in the `SPEC_LANDED` environment variable,
+  then in the highest-numbered `../evidence/sprint-<n>/D1/SPEC-LANDED.txt` (numbers compared as numbers),
+  and exits 1 when neither exists; `--spec-dir` and `--evidence-root` exist for the tests. (D4-01)
+- `validateNamespace` rejects the reserved prefix `__ld_` for callers. (D4-01)
+- `usage()` includes the vector index: `bytes` includes `vectorBytes`, `items` still counts key-value rows
+  only, and `vectorRows` and `vectorBytes` appear when an index is in scope. The soft quota counts key-value
+  and vector bytes together. `usage()`, `delete()` and the key-value calls create no kernel and emit no
+  `storage.index.*` event on a namespace without an index. (D4-03)
+- `delete(ns, key)` removes the vector row as well as the value and resolves true if either existed; a
+  corrupt index rejects it with `corrupt` before any value is touched. `clear(ns)` removes both. (D4-03)
+- `package.json`: version `0.2.0-alpha.0`; `npm run ci` now starts with `npm run build:wasm`; the CI three-OS
+  job installs the Rust 1.98 toolchain and caches it (both actions already in the conventions table, no new
+  action), runs `cargo fmt`, `clippy -D warnings` and `cargo test --locked`; the Pages build job builds the
+  WebAssembly before the demo, with `contents: read`. `test/workflows.test.ts` pins the pins and the rules.
+  (D4-05)
+- README restructured to the nine mandated sections in order (Develop and Security and privacy moved
+  under Quick start and How it works); Benchmarks is generated from the CSV; Limitations rewritten. (D4-04)
+- `docs/vector-index.md` is now the implemented design (flat index), no longer a proposal; the proposed
+  contract changes became Storage API 0.2.0. (D4-05)
+- The browser harness page's CSP gains `'wasm-unsafe-eval'`, as the demo's does, and nothing else. (D4-03)
 
 - README Status, Limitations and Security and privacy now say the `storage.*` events exist, are opt-in, synchronous and never awaited, and carry no key, prefix, value, driver message or stack; Event 0.1.2 namespace note added. (S1-078)
 - `scripts/sync-contracts.mjs` no longer has a sprint-scratch lookup: `$SPEC_LANDED`, then `../evidence/sprint-3/D1/SPEC-LANDED.txt`, else exit 1 and nothing synced. `test/portability.test.ts` allows 0 scratch-path occurrences. (T3-S3-026, BUG-T2-S3-21)
@@ -104,6 +174,10 @@ Ids: `D4-0x` are Sprint 2 items; `S3-D4-0x` are Sprint 3 items. Tester and produ
 
 ### Fixed
 
+- `Version` and the kernel's argument-error code could not collide: format errors are -1 to -14 and an
+  invalid pointer is -100 (found while writing the `a future format version` corruption case).
+  (D4-02)
+
 - `npm run pack:check` and `npm run test:browser` (through `install.spec.ts`) no longer need a sprint
   scratch directory, a pre-built `dist/` (the CI browser job does not build) or POSIX path handling:
   they build first, use `os.tmpdir()` and `path.relative`, and were proven with `TMPDIR` pointing at a
@@ -114,6 +188,26 @@ Ids: `D4-0x` are Sprint 2 items; `S3-D4-0x` are Sprint 3 items. Tester and produ
 - Vendored `src/contracts/storage-api.ts` re-synced from `runtime/spec` (`npm run sync-contracts`).
 
 ### Security
+
+- Vector operations never put a key, `filterPrefix`, vector component, score or value in an error message,
+  `details` or event: a bad row is identified by `details.row`. A sentinel test checks every failure path
+  (`test/vector-errors.test.ts`). (D4-03)
+- The reader treats every byte from storage as untrusted: the HEAD record is size-checked before it is
+  copied, counts are range-checked before they size anything, arithmetic is checked `u64`, the whole index is
+  checked against `maxIndexBytes` before any block is allocated, WebAssembly memory only grows after a part
+  has the length the HEAD implies, and a 200,000-iteration SplitMix64 mutation harness plus a differential
+  validator check the kernel's parsers (T2 runs 1,000,000 native and 10,000 WebAssembly cases). A trap
+  discards the instance. (D4-02, D4-03)
+- Builder paths: both embedded modules are built with `--remap-path-prefix` for the repository, the cargo
+  home and the rustup home, release profile `debug = false`, `strip = true`; `test/builder-paths.test.ts` and
+  `pack:check` fail on a macOS or Linux home-directory prefix, a Windows drive path, the cargo registry or
+  the rustup directory in the tarball, the generated module or the decoded WebAssembly (S1-088). (D4-02,
+  D4-05)
+- CRC-32C is documented as detecting accidental corruption only, and data in OPFS and IndexedDB as
+  unencrypted and readable by same-origin scripts (README Limitations). (D4-04)
+- The demo's CSP is `default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'
+  data:; connect-src 'none'; base-uri 'none'; form-action 'none'`, pinned by a test: no `unsafe-eval`, no
+  `unsafe-inline`, no `blob:`, no new origin. (D4-05)
 
 - `storage.*` events are built from fixed fields only: the namespace (or `''` when it fails
   validation), the driver name, an outcome from a closed set, byte counts and a duration. A sentinel
