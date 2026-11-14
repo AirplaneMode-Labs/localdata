@@ -20,3 +20,8 @@ coverage/
 .playwright/
 .scratch/
 *.tgz
+
+# Rust and WASM build output (scripts/build-wasm.mjs); the embedded modules are generated, not tracked
+src/wasm/*.gen.ts
+*.wasm
+release-manifest*.json

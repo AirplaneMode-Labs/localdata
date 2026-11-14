@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/ldvec"]
+
+# Release profile for the WASM builds (scripts/build-wasm.mjs). Debug info is off and symbols are
+# stripped so no builder path survives; panic = "abort" keeps the module small and makes any bug a
+# WebAssembly trap, which the TypeScript boundary turns into a StorageError.
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+debug = false
+strip = true

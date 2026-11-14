@@ -1,0 +1,14 @@
+[package]
+name = "ldvec"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+description = "Flat vector index kernel for @airplanemode/localdata: CRC-32C, on-disk validation, norms and a bit-exact SIMD or scalar scan."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Zero dependencies on purpose (build-or-adopt rule TD-17): the scan is about 300 lines.
+[dependencies]

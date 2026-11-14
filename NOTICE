@@ -3,6 +3,9 @@ Copyright 2026 Tushar (jtushar53@gmail.com)
 
 This product includes software developed at Airplane Mode Labs (https://github.com/AirplaneMode-Labs).
 
+The embedded ldvec WebAssembly modules (src/wasm) are Airplane Mode Labs code (Apache-2.0). The Rust
+standard library (MIT OR Apache-2.0) is compiled into both modules.
+
 Third-party notices
 -------------------
 This package has no runtime dependencies. Development-only tooling (TypeScript, tsup, Vitest,
