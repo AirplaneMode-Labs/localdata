@@ -4,9 +4,18 @@ import { StorageError, type StorageDriver } from './contracts/storage-api';
 import { IndexedDbDriver } from './drivers/indexeddb';
 import { MemoryDriver } from './drivers/memory';
 import { OpfsDriver } from './drivers/opfs';
-import { LocalData } from './store';
+import type { EventSink } from './contracts/event';
+import { LocalData, type LocalDataOptions } from './store';
 
 export * from './contracts/storage-api';
+export {
+  EVENT_SPEC,
+  STORAGE_EVENT_NAMES,
+  type Event,
+  type EventAttrs,
+  type EventSink,
+  type StorageEventName,
+} from './contracts/event';
 export { LocalData, validateKey, validateNamespace, type LocalDataOptions } from './store';
 export { MemoryDriver } from './drivers/memory';
 export { OpfsDriver } from './drivers/opfs';
@@ -24,6 +33,14 @@ export interface CreateStoreOptions {
   quotaBytes?: number;
   /** Injectable clock in epoch milliseconds (TTL); defaults to Date.now. */
   clock?: () => number;
+  /**
+   * Optional EventSink receiving storage.set, storage.get, storage.delete and storage.quota events
+   * (Event 0.1.2, source "localdata"). Never receives a key, prefix or value; the namespace does
+   * appear. Called synchronously inside try/catch and never awaited.
+   */
+  events?: EventSink;
+  /** Session id for events (1..64 chars); pass the runtime's sessionId() to share one id. */
+  eventSession?: string;
 }
 
 export function opfsAvailable(): boolean {
@@ -74,8 +91,10 @@ function resolveDriver(choice: DriverChoice): StorageDriver {
 /** Opens a store. The returned object implements StorageApi. */
 export async function createStore(opts: CreateStoreOptions = {}): Promise<LocalData> {
   const driver = resolveDriver(opts.driver ?? 'auto');
-  const ldOpts: { driver: StorageDriver; quotaBytes?: number; clock?: () => number } = { driver };
+  const ldOpts: LocalDataOptions = { driver };
   if (opts.quotaBytes !== undefined) ldOpts.quotaBytes = opts.quotaBytes;
   if (opts.clock !== undefined) ldOpts.clock = opts.clock;
+  if (opts.events !== undefined) ldOpts.events = opts.events;
+  if (opts.eventSession !== undefined) ldOpts.eventSession = opts.eventSession;
   return LocalData.open(ldOpts);
 }

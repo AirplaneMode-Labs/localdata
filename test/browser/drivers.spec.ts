@@ -94,6 +94,37 @@ for (const driver of DRIVERS) {
   });
 }
 
+for (const driver of DRIVERS) {
+  test(`storage.* events over the real ${driver} driver: shape, driver attr, sink never awaited, no key or value`, async ({
+    page,
+  }) => {
+    await openHarness(page);
+    const run = await page.evaluate((d) => window.__localdata.runEvents(d), driver);
+    expect(run.names).toEqual([
+      'storage.set',
+      'storage.get',
+      'storage.get',
+      'storage.delete',
+      'storage.delete',
+      'storage.quota',
+      'storage.set',
+    ]);
+    expect(run.outcomes).toEqual([
+      'ok',
+      'hit',
+      'miss',
+      'removed',
+      'absent',
+      undefined,
+      'quota_exceeded',
+    ]);
+    expect(run.drivers).toEqual(Array(7).fill(driver));
+    expect(run.problems, run.problems.join('\n')).toEqual([]);
+    expect(run.leaked).toEqual([]);
+    expect(run.sinkThrewButStoreWorked).toBe(true);
+  });
+}
+
 test('no request left the harness origin in any scenario', async () => {
   expect(requestLog.length).toBeGreaterThan(0);
   const foreign = requestLog.filter((u) => !u.startsWith(`${BASE_URL}/`));

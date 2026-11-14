@@ -16,6 +16,15 @@ import {
 } from './contracts/storage-api';
 import { META_NS } from './drivers/types';
 import { toStorageError } from './errors';
+import type { EventSink } from './contracts/event';
+import {
+  StorageEvents,
+  eventOptionProblem,
+  outcomeOf,
+  type DeleteOutcome,
+  type GetOutcome,
+  type SetOutcome,
+} from './events';
 
 export interface LocalDataOptions {
   driver: StorageDriver;
@@ -23,6 +32,14 @@ export interface LocalDataOptions {
   quotaBytes?: number;
   /** Injectable clock (epoch ms) used for TTL. Defaults to Date.now. */
   clock?: () => number;
+  /**
+   * Optional sink for storage.set / get / delete / quota events (Event 0.1.2, source "localdata").
+   * Called synchronously inside try/catch and never awaited. Events never carry a key, a prefix or a
+   * value; the namespace does appear, so do not encode personal data in namespace names.
+   */
+  events?: EventSink;
+  /** Session id stamped on events (1..64 chars): pass the runtime's sessionId() to share one id. */
+  eventSession?: string;
 }
 
 interface IndexEntry {
@@ -72,6 +89,7 @@ export class LocalData implements StorageApi {
   private readonly d: StorageDriver;
   private readonly quotaBytes: number | undefined;
   private readonly clock: () => number;
+  private readonly ev: StorageEvents;
   private readonly index = new Map<string, Map<string, IndexEntry>>();
   private closed = false;
 
@@ -80,6 +98,7 @@ export class LocalData implements StorageApi {
     this.driver = opts.driver.name;
     this.quotaBytes = opts.quotaBytes;
     this.clock = opts.clock ?? (() => Date.now());
+    this.ev = new StorageEvents(opts.events, opts.driver.name, opts.eventSession);
   }
 
   static async open(opts: LocalDataOptions): Promise<LocalData> {
@@ -89,6 +108,8 @@ export class LocalData implements StorageApi {
     ) {
       throw new StorageError('invalid_value', 'quotaBytes must be a non-negative finite number');
     }
+    const eventProblem = eventOptionProblem(opts);
+    if (eventProblem !== undefined) throw new StorageError('invalid_value', eventProblem);
     const store = new LocalData(opts);
     try {
       await opts.driver.open();
@@ -183,6 +204,26 @@ export class LocalData implements StorageApi {
   // ----- StorageApi -------------------------------------------------------------------------
 
   async set(ns: string, key: string, value: StorableValue, opts?: SetOptions): Promise<void> {
+    const t0 = this.ev.start();
+    const probe: { bytes?: number } = {};
+    let outcome: SetOutcome = 'ok';
+    try {
+      await this.setCore(ns, key, value, opts, probe);
+    } catch (e) {
+      outcome = outcomeOf(e);
+      throw e;
+    } finally {
+      this.ev.set(t0, ns, outcome, probe.bytes);
+    }
+  }
+
+  private async setCore(
+    ns: string,
+    key: string,
+    value: StorableValue,
+    opts: SetOptions | undefined,
+    probe: { bytes?: number },
+  ): Promise<void> {
     this.ensureOpen();
     validateNamespace(ns);
     validateKey(key);
@@ -196,11 +237,13 @@ export class LocalData implements StorageApi {
       expiresAt = this.clock() + opts.ttlMs;
     }
     const bytes = await encode(value);
+    probe.bytes = bytes.byteLength;
     const m = await this.nsIndex(ns);
     const previous = m.get(key)?.size ?? 0;
     if (this.quotaBytes !== undefined) {
       const needed = this.totalBytes() - previous + bytes.byteLength;
       if (needed > this.quotaBytes) {
+        this.ev.quota(ns, this.totalBytes(), this.quotaBytes, needed - this.quotaBytes, 'warn');
         throw new StorageError(
           'quota_exceeded',
           `writing ${bytes.byteLength} bytes would bring usage to ${needed} bytes, above the configured quota of ${this.quotaBytes}`,
@@ -222,13 +265,37 @@ export class LocalData implements StorageApi {
       m.set(key, e);
       await this.persist(ns);
     } catch (e) {
-      throw toStorageError(e, 'set');
+      const err = toStorageError(e, 'set');
+      // The browser (not the SDK soft quota) refused: its limit is unknown, so quota is null and
+      // needed is the size of the write, an upper bound for what did not fit.
+      if (err.code === 'quota_exceeded') {
+        this.ev.quota(ns, this.totalBytes(), null, bytes.byteLength, 'warn');
+      }
+      throw err;
     }
   }
 
   async get<T extends StorableValue = StorableValue>(
     ns: string,
     key: string,
+  ): Promise<T | undefined> {
+    const t0 = this.ev.start();
+    const probe: { outcome?: GetOutcome; bytes?: number } = {};
+    try {
+      return await this.getCore<T>(ns, key, probe);
+    } catch (e) {
+      probe.outcome = outcomeOf(e);
+      delete probe.bytes;
+      throw e;
+    } finally {
+      this.ev.get(t0, ns, probe.outcome ?? 'io', probe.bytes);
+    }
+  }
+
+  private async getCore<T extends StorableValue>(
+    ns: string,
+    key: string,
+    probe: { outcome?: GetOutcome; bytes?: number },
   ): Promise<T | undefined> {
     this.ensureOpen();
     validateNamespace(ns);
@@ -238,6 +305,7 @@ export class LocalData implements StorageApi {
       const entry = m.get(key);
       if (entry && this.isExpired(entry)) {
         await this.removeRow(ns, key, m);
+        probe.outcome = 'expired';
         return undefined;
       }
       const rec = await this.d.getBytes(ns, key);
@@ -246,10 +314,12 @@ export class LocalData implements StorageApi {
           m.delete(key);
           await this.persist(ns);
         }
+        probe.outcome = 'miss';
         return undefined;
       }
       if (rec.meta.expiresAt !== undefined && rec.meta.expiresAt <= this.clock()) {
         await this.removeRow(ns, key, m);
+        probe.outcome = 'expired';
         return undefined;
       }
       if (!entry) {
@@ -259,13 +329,31 @@ export class LocalData implements StorageApi {
         m.set(key, e);
         await this.persist(ns);
       }
-      return decode(rec.bytes) as T;
+      const value = decode(rec.bytes) as T;
+      probe.outcome = 'hit';
+      probe.bytes = rec.bytes.byteLength;
+      return value;
     } catch (e) {
       throw toStorageError(e, 'get');
     }
   }
 
   async delete(ns: string, key: string): Promise<boolean> {
+    const t0 = this.ev.start();
+    let outcome: DeleteOutcome = 'absent';
+    try {
+      const removed = await this.deleteCore(ns, key);
+      outcome = removed ? 'removed' : 'absent';
+      return removed;
+    } catch (e) {
+      outcome = outcomeOf(e);
+      throw e;
+    } finally {
+      this.ev.delete(t0, ns, outcome);
+    }
+  }
+
+  private async deleteCore(ns: string, key: string): Promise<boolean> {
     this.ensureOpen();
     validateNamespace(ns);
     validateKey(key);
@@ -320,6 +408,7 @@ export class LocalData implements StorageApi {
     }
     const out: UsageResult = { bytes, items };
     if (this.quotaBytes !== undefined) out.quotaBytes = this.quotaBytes;
+    this.ev.quota(ns ?? '', bytes, this.quotaBytes ?? null, 0, 'debug');
     return out;
   }
 

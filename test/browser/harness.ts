@@ -1,7 +1,13 @@
 // Browser harness bundled by test/browser/serve.mjs. It exposes window.__localdata so the
 // Playwright spec can run the shared behavioural suite against the OPFS and IndexedDB drivers,
 // check persistence across reload, and measure write throughput. No network access.
-import { createStore, STORAGE_ROOT, type StorageApi } from '../../src/index';
+import {
+  createStore,
+  STORAGE_EVENT_NAMES,
+  STORAGE_ROOT,
+  type Event,
+  type StorageApi,
+} from '../../src/index';
 import { collectSuite, type MakeStoreOptions, type SuiteResult } from '../storage.behaviour';
 
 type DriverName = 'opfs' | 'indexeddb';
@@ -160,10 +166,86 @@ async function bench(driver: DriverName): Promise<BenchResult> {
   }
 }
 
+const EVENT_SENTINELS = ['SENTINEL-KEY-4e8b', 'SENTINEL-VALUE-91d0'];
+
+/** Runs set, get (hit, miss), delete (removed, absent) and a soft-quota refusal with an EventSink. */
+async function runEvents(driver: DriverName): Promise<{
+  names: string[];
+  outcomes: Array<string | undefined>;
+  drivers: Array<string | undefined>;
+  problems: string[];
+  leaked: string[];
+  sinkThrewButStoreWorked: boolean;
+}> {
+  await reset(driver);
+  const events: Event[] = [];
+  const store = await createStore({
+    driver,
+    quotaBytes: 2048,
+    events: { emit: (e) => void events.push(e) },
+  });
+  const [key, value] = EVENT_SENTINELS as [string, string];
+  try {
+    await store.set('events', key, { v: value });
+    await store.get('events', key);
+    await store.get('events', `${key}-missing`);
+    await store.delete('events', key);
+    await store.delete('events', key);
+    try {
+      await store.set('events', 'big', new Uint8Array(4096));
+    } catch {
+      // expected: quota_exceeded
+    }
+  } finally {
+    await store.close();
+  }
+  const problems: string[] = [];
+  const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  for (const e of events) {
+    if (e.spec !== 'airplanemode.event/0.1') problems.push(`${e.name}: spec`);
+    if (!UUID_V4.test(e.id)) problems.push(`${e.name}: id`);
+    if (e.source !== 'localdata') problems.push(`${e.name}: source`);
+    if (!Number.isInteger(e.ts)) problems.push(`${e.name}: ts`);
+    if (typeof e.session !== 'string' || e.session.length < 1 || e.session.length > 64)
+      problems.push(`${e.name}: session`);
+    if (!(STORAGE_EVENT_NAMES as readonly string[]).includes(e.name))
+      problems.push(`${e.name}: name`);
+    if (e.name !== 'storage.quota' && !(typeof e.durationMs === 'number' && e.durationMs >= 0))
+      problems.push(`${e.name}: durationMs`);
+    for (const [k, v] of Object.entries(e.attrs))
+      if (!(typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || v === null))
+        problems.push(`${e.name}: attr ${k}`);
+  }
+  const wire = JSON.stringify(events);
+  const leaked = EVENT_SENTINELS.filter((s) => wire.includes(s));
+  // A sink that throws must not break the store.
+  const bad = await createStore({
+    driver: 'memory',
+    events: {
+      emit: () => {
+        throw new Error('sink exploded');
+      },
+    },
+  });
+  await bad.set('events', 'k', 1);
+  const sinkThrewButStoreWorked = (await bad.get('events', 'k')) === 1;
+  await bad.close();
+  await reset(driver);
+  return {
+    names: events.map((e) => e.name),
+    outcomes: events.map((e) => e.attrs['outcome'] as string | undefined),
+    drivers: events.map((e) => e.attrs['driver'] as string | undefined),
+    problems,
+    leaked,
+    sinkThrewButStoreWorked,
+  };
+}
+
 const api = {
   ready: true,
   reset,
   runSuite,
+  runEvents,
   persistWrite,
   persistCheck,
   bench,
