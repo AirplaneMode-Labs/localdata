@@ -1,22 +1,50 @@
 #!/usr/bin/env node
-// Copies the Storage API contract from the sibling runtime repository (../runtime/spec) into
-// src/contracts/, prepending the vendoring header. The source of truth is runtime/spec; never edit
-// the vendored copy by hand. Exits 0 and prints a notice when the sibling is absent.
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+// Copies the two contracts localdata vendors from the sibling runtime repository (../runtime/spec)
+// into src/contracts/, prepending the vendoring header: storage-api.ts @ 0.1.0 and event.ts @ 0.1.2.
+// The source of truth is runtime/spec; never edit a vendored copy by hand.
+//
+// The copy is gated on the spec release's SPEC-LANDED.txt (one `sha256  path` line per spec file):
+// every source file must hash to its recorded value, otherwise NOTHING is copied. SPEC-LANDED.txt is
+// looked up in this order, the same order dockit uses:
+//   1. the SPEC_LANDED environment variable (a path; if set and missing, that is an error);
+//   2. <workspace>/evidence/sprint-3/D1/SPEC-LANDED.txt, the committed copy beside this repository.
+// With neither, the script exits 1 and copies nothing.
+//
+//   node scripts/sync-contracts.mjs            copy (when the hashes match)
+//   node scripts/sync-contracts.mjs --check    report in-sync or drift, write nothing, exit 1 on drift
+//
+// Exits 0 with a notice when ../runtime/spec is absent (a standalone clone has nothing to sync).
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, '..');
 
-export const CONTRACTS = [
-  {
-    source: resolve(repo, '..', 'runtime', 'spec', 'storage-api.ts'),
-    target: resolve(repo, 'src', 'contracts', 'storage-api.ts'),
-    header:
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.1.0; source of truth is runtime/spec; do not edit here\n',
-  },
-];
+export const DEFAULT_SPEC_DIR = resolve(repo, '..', 'runtime', 'spec');
+export const DEFAULT_OUT_DIR = resolve(repo, 'src', 'contracts');
+
+// Each contract carries its own version (spec release 0.3.0): the header names that contract's
+// version, not the release's.
+export const CONTRACT_VERSIONS = {
+  'storage-api.ts': '0.1.0',
+  'event.ts': '0.1.2',
+};
+export const CONTRACT_FILES = Object.keys(CONTRACT_VERSIONS);
+
+export const header = (file) => {
+  const version = CONTRACT_VERSIONS[file];
+  if (version === undefined) throw new Error(`sync-contracts: no version recorded for ${file}`);
+  return `// Vendored from AirplaneMode-Labs/runtime spec/${file} @ ${version}; source of truth is runtime/spec; do not edit here\n`;
+};
+
+export const CONTRACTS = CONTRACT_FILES.map((file) => ({
+  file,
+  source: join(DEFAULT_SPEC_DIR, file),
+  target: join(DEFAULT_OUT_DIR, file),
+  header: header(file),
+}));
 
 export function vendoredBody(text) {
   // Strip the single-line vendoring header so the remainder can be diffed against the source.
@@ -24,23 +52,108 @@ export function vendoredBody(text) {
   return text.startsWith('// Vendored from ') && nl !== -1 ? text.slice(nl + 1) : text;
 }
 
-export function sync({ write = true } = {}) {
+/**
+ * Parses `shasum -a 256` style lines into Map<listed path, sha256>. The key is the path exactly as
+ * listed (a leading `./` removed), so `README.md` and `vectors/README.md` stay distinct. Lines that
+ * are not `<64 hex>  <path>` are ignored.
+ */
+export function parseLanded(text) {
+  const map = new Map();
+  for (const line of text.split('\n')) {
+    const m = /^([0-9a-f]{64})\s+\*?(.+?)\s*$/u.exec(line.trim());
+    if (m) map.set(m[2].replace(/^\.\//u, ''), m[1]);
+  }
+  return map;
+}
+
+/**
+ * Where SPEC-LANDED.txt is read from (see the header comment for the order). Returns
+ * `{ path, source: 'env' | 'evidence' }`; `{ ..., missing: true }` when SPEC_LANDED names
+ * a file that does not exist (never a silent fall-through); undefined when none exists.
+ * @param {{ env?: Record<string, string | undefined>, repo?: string, exists?: (p: string) => boolean }} [opts]
+ */
+export function findSpecLanded({
+  env = process.env,
+  repo: repoRoot = repo,
+  exists = existsSync,
+} = {}) {
+  const fromEnv = env['SPEC_LANDED'];
+  if (fromEnv !== undefined && fromEnv !== '') {
+    const path = resolve(fromEnv);
+    return exists(path) ? { path, source: 'env' } : { path, source: 'env', missing: true };
+  }
+  const evidence = resolve(repoRoot, '..', 'evidence', 'sprint-3', 'D1', 'SPEC-LANDED.txt');
+  if (exists(evidence)) return { path: evidence, source: 'evidence' };
+  return undefined;
+}
+
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+
+/**
+ * Compare (and optionally rewrite) every vendored contract against runtime/spec. Returns one
+ * `{ file, target, status }` per contract with status 'in-sync' | 'drift' | 'updated' |
+ * 'source-missing' | 'sha-mismatch' | 'sha-missing' | 'blocked'. Nothing is written when `write` is
+ * false. When `landed` (from parseLanded) is given, every source file's sha256 must equal its entry:
+ * any mismatch, absent entry or missing source fails the whole sync, nothing is written, and the
+ * files that checked out are reported as 'blocked'.
+ * @param {{ specDir?: string, outDir?: string, write?: boolean, landed?: Map<string, string> }} [opts]
+ */
+export function sync({
+  specDir = DEFAULT_SPEC_DIR,
+  outDir = DEFAULT_OUT_DIR,
+  write = true,
+  landed = undefined,
+} = {}) {
+  if (landed !== undefined) {
+    const checks = CONTRACT_FILES.map((file) => {
+      const source = join(specDir, file);
+      const target = join(outDir, file);
+      if (!existsSync(source)) return { file, target, status: 'source-missing' };
+      const want = landed.get(file);
+      if (want === undefined) return { file, target, status: 'sha-missing' };
+      const got = sha256(readFileSync(source));
+      return { file, target, status: want === got ? 'ok' : 'sha-mismatch' };
+    });
+    if (checks.some((r) => r.status !== 'ok'))
+      return checks.map((r) => (r.status === 'ok' ? { ...r, status: 'blocked' } : r));
+  }
   const results = [];
-  for (const c of CONTRACTS) {
-    if (!existsSync(c.source)) {
-      results.push({ target: c.target, status: 'source-missing' });
+  for (const file of CONTRACT_FILES) {
+    const source = join(specDir, file);
+    const target = join(outDir, file);
+    if (!existsSync(source)) {
+      results.push({ file, target, status: 'source-missing' });
       continue;
     }
-    const src = readFileSync(c.source, 'utf8');
-    const current = existsSync(c.target) ? readFileSync(c.target, 'utf8') : '';
+    const src = readFileSync(source, 'utf8');
+    const current = existsSync(target) ? readFileSync(target, 'utf8') : '';
     const inSync = vendoredBody(current) === src;
-    if (!inSync && write) writeFileSync(c.target, c.header + src);
-    results.push({ target: c.target, status: inSync ? 'in-sync' : write ? 'updated' : 'drift' });
+    if (!inSync && write) writeFileSync(target, header(file) + src);
+    results.push({ file, target, status: inSync ? 'in-sync' : write ? 'updated' : 'drift' });
   }
   return results;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (!existsSync(DEFAULT_SPEC_DIR)) {
+    console.log(`sync-contracts: ${DEFAULT_SPEC_DIR} not found; nothing to do`);
+    process.exit(0);
+  }
+  const located = findSpecLanded();
+  if (located === undefined || located.missing) {
+    const where = located
+      ? `SPEC_LANDED=${located.path}`
+      : resolve(repo, '..', 'evidence', 'sprint-3', 'D1', 'SPEC-LANDED.txt');
+    console.error(
+      `sync-contracts: SPEC-LANDED.txt not found (${where}): set SPEC_LANDED or copy it to the evidence folder; nothing synced`,
+    );
+    process.exit(1);
+  }
+  console.log(`sync-contracts: SPEC-LANDED.txt from ${located.source}: ${located.path}`);
+  const landed = parseLanded(readFileSync(located.path, 'utf8'));
   const check = process.argv.includes('--check');
-  for (const r of sync({ write: !check })) console.log(`${r.status}\t${r.target}`);
+  const results = sync({ write: !check, landed });
+  for (const r of results) console.log(`${r.status}\t${r.target}`);
+  const bad = new Set(['drift', 'sha-mismatch', 'sha-missing', 'source-missing', 'blocked']);
+  if (results.some((r) => bad.has(r.status))) process.exit(1);
 }
