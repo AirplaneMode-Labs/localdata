@@ -18,6 +18,11 @@
         Everything runs in this tab. Nothing is uploaded; the only network requests are for this
         page's own files.
       </p>
+      <p class="status-line" id="sprint-status">
+        Sprint 3 (14 Nov 2026). set/get/delete/list over OPFS, IndexedDB or memory, with
+        storage.set, storage.get, storage.delete and storage.quota events through an optional sink,
+        listed live below; query() not_implemented naming Sprint 4.
+      </p>
       <p class="status-line">
         Built from main at <code id="build-sha" data-sha="__BUILD_SHA__">local</code> by
         <code>.github/workflows/pages.yml</code>
@@ -63,6 +68,14 @@
             >).
           </li>
           <li>There is no vector index and no similarity search of any kind (Sprint 4).</li>
+          <li>
+            The <code>storage.*</code> events reach only the list on this page: it registers an
+            <code>EventSink</code> and renders what it receives. This page does not load the
+            runtime, so the Airplane Mode DevTools panel does not show them; an app wires both by
+            passing the same sink to <code>createStore({ events })</code>. The cost of events on a
+            large workload has not been measured.
+          </li>
+          <li>Not published: the npm scope and package name are not reserved; not tagged.</li>
           <li>
             No cross-tab coordination: two tabs writing the same namespace can leave the accounting
             record stale until the next read repairs it.
@@ -151,6 +164,17 @@
           <button id="persist" type="button">Request persist()</button>
           <span id="persist-result" class="muted"></span>
         </div>
+      </section>
+
+      <section id="events-panel" class="box">
+        <h2>storage.* events (live)</h2>
+        <!-- prettier-ignore -->
+        <p>This page registers an EventSink with createStore({ events }) and lists every event it receives, newest first, last 50 only. Each event carries the namespace, the driver, an outcome, a byte count and a duration. It never carries a key, a prefix or a value.</p>
+        <div class="row">
+          <button id="events-clear" type="button">Clear list</button>
+          <span id="events-count" class="muted">0 event(s) received</span>
+        </div>
+        <ol id="events-list" class="events" aria-live="polite"></ol>
       </section>
 
       <section id="query" class="box">

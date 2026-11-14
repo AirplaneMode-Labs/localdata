@@ -224,3 +224,37 @@ a {
     flex: 1 1 8em;
   }
 }
+
+.events {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 18em;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+
+.events:empty::before {
+  content: 'No events yet. Open a store and press Set, Get or Delete.';
+  display: block;
+  padding: 6px 8px;
+  color: var(--muted);
+}
+
+.events li {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line);
+  word-break: break-word;
+}
+
+.events li[data-level='warn'] {
+  color: var(--bad);
+}
+
+.events li[data-level='debug'] {
+  color: var(--muted);
+}

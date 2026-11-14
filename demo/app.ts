@@ -1,14 +1,18 @@
 // Public demo for @airplanemode/localdata. Bundled by demo/build.mjs into demo/dist/app.js. It
 // exercises the SDK's set/get/delete/list/usage surface against the OPFS, IndexedDB and memory
-// drivers, shows navigator.storage.estimate() and persist(), calls the not-yet-implemented query()
-// so the error is visible, and fills quota with synthetic data under the namespace demo-fill.
+// drivers, lists the storage.* events the SDK emits to an EventSink, shows
+// navigator.storage.estimate() and persist(), calls the not-yet-implemented query() so the error is
+// visible, and fills quota with synthetic data under the namespace demo-fill.
 // It makes no network request and touches no storage outside localdata's own OPFS directory and
 // IndexedDB database (airplanemode-localdata).
 import {
   createStore,
   indexedDbAvailable,
   opfsAvailable,
+  STORAGE_EVENT_NAMES,
   StorageError,
+  type Event,
+  type EventSink,
   type LocalData,
   type StorableValue,
 } from '../src/index.ts';
@@ -61,6 +65,9 @@ const ui = {
   fillClear: el<HTMLButtonElement>('fill-clear'),
   fillProgress: el<HTMLParagraphElement>('fill-progress'),
   fillOut: el<HTMLPreElement>('fill-out'),
+  eventsList: el<HTMLOListElement>('events-list'),
+  eventsCount: el<HTMLSpanElement>('events-count'),
+  eventsClear: el<HTMLButtonElement>('events-clear'),
 };
 
 // ----- feature detection ---------------------------------------------------------------------
@@ -169,6 +176,57 @@ function print(target: HTMLElement, text: string): void {
   target.textContent = `[${stamp()}] ${text}`;
 }
 
+// ----- storage.* events panel ----------------------------------------------------------------
+
+// The sink the demo passes to createStore({ events }). It keeps the last EVENT_LIMIT events and
+// renders them with createElement and textContent only (attribute values come from fixed enums).
+// Events never carry a key, a prefix or a value, so nothing here can show one.
+
+const EVENT_LIMIT = 50;
+const LEVELS: readonly string[] = ['debug', 'info', 'warn', 'error'];
+const recentEvents: Event[] = [];
+let eventsReceived = 0;
+let eventsRenderQueued = false;
+
+function formatEvent(e: Event): string {
+  const attrs = Object.entries(e.attrs)
+    .map(([k, v]) => `${k}=${v === null ? 'null' : typeof v === 'string' ? `'${v}'` : String(v)}`)
+    .join(' ');
+  const bytes = e.bytes !== undefined ? ` bytes=${e.bytes}` : '';
+  const ms = e.durationMs !== undefined ? ` ${e.durationMs.toFixed(2)} ms` : '';
+  return `${new Date(e.ts).toISOString().slice(11, 23)} ${e.level} ${e.name} ${attrs}${bytes}${ms}`;
+}
+
+function renderEvents(): void {
+  const items = recentEvents.map((e) => {
+    const li = document.createElement('li');
+    li.setAttribute(
+      'data-event',
+      (STORAGE_EVENT_NAMES as readonly string[]).includes(e.name) ? e.name : 'other',
+    );
+    li.setAttribute('data-level', LEVELS.includes(e.level) ? e.level : 'info');
+    li.textContent = formatEvent(e);
+    return li;
+  });
+  ui.eventsList.replaceChildren(...items);
+  ui.eventsCount.textContent = `${eventsReceived} event(s) received, newest ${items.length} shown`;
+}
+
+const eventSink: EventSink = {
+  emit(e: Event): void {
+    eventsReceived++;
+    recentEvents.unshift(e);
+    if (recentEvents.length > EVENT_LIMIT) recentEvents.length = EVENT_LIMIT;
+    if (!eventsRenderQueued) {
+      eventsRenderQueued = true;
+      queueMicrotask(() => {
+        eventsRenderQueued = false;
+        renderEvents();
+      });
+    }
+  },
+};
+
 // ----- navigator.storage panel ---------------------------------------------------------------
 
 async function refreshStoragePanel(): Promise<void> {
@@ -242,7 +300,10 @@ async function openStore(): Promise<void> {
   try {
     const driver = ui.driver.value as DriverName;
     const quotaBytes = parseQuota();
-    const opts: { driver: DriverName; quotaBytes?: number } = { driver };
+    const opts: { driver: DriverName; quotaBytes?: number; events: EventSink } = {
+      driver,
+      events: eventSink,
+    };
     if (quotaBytes !== undefined) opts.quotaBytes = quotaBytes;
     store = await createStore(opts);
     const total = await store.usage();
@@ -521,6 +582,10 @@ function wire(): void {
     stopRequested = true;
   });
   ui.fillClear.addEventListener('click', () => void clearFill());
+  ui.eventsClear.addEventListener('click', () => {
+    recentEvents.length = 0;
+    renderEvents();
+  });
 }
 
 renderRequirements(detectFeatures());
