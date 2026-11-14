@@ -1,7 +1,7 @@
 {
   "name": "@airplanemode/localdata",
-  "version": "0.1.0-dev",
-  "description": "Offline-first browser storage SDK: set/get/delete/query over OPFS with an IndexedDB fallback.",
+  "version": "0.2.0-alpha.0",
+  "description": "Offline-first browser storage SDK: set/get/delete over OPFS with an IndexedDB fallback, and a flat vector index (putVectors/query) with a WebAssembly scan.",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
@@ -33,11 +33,13 @@
     "url": "https://github.com/AirplaneMode-Labs/localdata/issues"
   },
   "keywords": [
-    "opfs",
+    "browser",
     "indexeddb",
     "offline-first",
+    "opfs",
     "storage",
-    "browser"
+    "vector-search",
+    "webassembly"
   ],
   "scripts": {
     "build": "tsup --no-sourcemap",
@@ -50,8 +52,12 @@
     "fmt:check": "prettier --check .",
     "deps:scripts": "npm query ':attr(scripts,[postinstall]),:attr(scripts,[preinstall])'",
     "sync-contracts": "node scripts/sync-contracts.mjs",
-    "ci": "npm run fmt:check && npm run typecheck && npm run test && npm run build",
-    "pack:check": "node scripts/pack-check.mjs"
+    "ci": "npm run build:wasm && npm run fmt:check && npm run typecheck && npm run test && npm run build",
+    "pack:check": "node scripts/pack-check.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "fixture:tiny": "LDVEC_WRITE_FIXTURE=1 vitest run test/tiny-fixture.test.ts",
+    "bench:vectors": "playwright test -c test/browser/playwright.bench.config.ts",
+    "bench:readme": "node scripts/bench-readme.mjs --write"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

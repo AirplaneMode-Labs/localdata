@@ -34,7 +34,18 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: '1.98'
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: npm ci
+      # The ldvec kernel: format, lint and test the Rust crate (zero dependencies), --locked everywhere.
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked
+      # npm run ci builds both WebAssembly modules first (npm run build:wasm), then fmt, typecheck, test, build.
       - run: npm run ci
       - run: npm run pack:check
       - run: npm run demo:build
@@ -53,7 +64,14 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: '1.98'
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: npm ci
+      - run: npm run build:wasm
       # S1-064: no Playwright/apt Chrome install. The runner's preinstalled Google Chrome is used
       # through Playwright channel "chrome"; a missing Chrome fails the job.
       - name: Check the preinstalled Google Chrome

@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // Packs the SDK, checks the tarball against the packaging rules, installs it offline into a fresh
-// empty directory from an empty npm cache, and runs a real round trip (set, get, delete and the
-// storage.* events) from the installed copy. Nothing here publishes anything.
+// empty directory from an empty npm cache, and runs real calls from the installed copy: a key-value round
+// trip with its storage.* events, and the vector index (three rows written, one query, the keys printed).
+// The two WebAssembly modules embedded in dist/index.js must equal a fresh path-remapped build
+// (scripts/build-wasm.mjs --check), and neither the tarball nor the decoded modules may hold a builder
+// path. Nothing here publishes anything.
 //
 //   node scripts/pack-check.mjs [--out <dir>] [--skip-build] [--keep]
 //
@@ -14,7 +17,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -90,7 +93,10 @@ for (const d of [packDir, fresh, cache]) {
   mkdirSync(d, { recursive: true });
 }
 
-if (!flag('--skip-build')) npm(['run', 'build'], repo);
+if (!flag('--skip-build')) {
+  npm(['run', 'build:wasm'], repo);
+  npm(['run', 'build'], repo);
+}
 
 // ---- 1. the tarball -----------------------------------------------------------------------------
 const packed = JSON.parse(
@@ -114,7 +120,15 @@ for (const need of [
 ])
   check(names.includes(need), `tarball contains ${need}`);
 check(!names.some((n) => n.endsWith('.map')), 'no source map in the tarball');
+check(!names.some((n) => n.endsWith('.wasm')), 'no .wasm sidecar (the modules are embedded)');
+check(
+  !names.some(
+    (n) => /(^|\/)(crates|target|bench|scripts|\.github)\//.test(n) || /\.(rs|toml)$/.test(n),
+  ),
+  'no Rust source, build script or CI file in the tarball',
+);
 check(!files.some((f) => f.size > 5 * 1024 * 1024), 'no file over 5 MB');
+check(packed.size < 5 * 1024 * 1024, `the tarball is under 5 MB (${packed.size} bytes)`);
 check(
   !names.some((n) => /(^|\/)(test|demo|docs|src)\//.test(n)),
   'no test, demo, docs or src in the tarball',
@@ -158,6 +172,56 @@ check(!js.includes('sourceMappingURL'), 'no dangling sourceMappingURL');
 // Builder paths must not leak into a published artifact (the patterns are regex sources on purpose).
 const LEAK = /\/Users\/|\/home\/[a-z]|\/private\/tmp|[A-Za-z]:\\+Users\\/;
 check(!LEAK.test(js), 'no builder or scratch path in dist/index.js');
+// Builder paths in the shipped bytes, including the embedded WebAssembly modules decoded from base64.
+// (The needles are built from pieces so this file does not match its own portability scan.)
+const NEEDLES = [
+  ['/Us', 'ers/'].join(''),
+  ['/ho', 'me/'].join(''),
+  ['C:', '\\'].join(''),
+  ['.cargo', '/registry'].join(''),
+  ['.rus', 'tup'].join(''),
+  homedir(),
+  repo,
+];
+const dts = readFileSync(join(installed, 'dist', 'index.d.ts'), 'utf8');
+for (const n of NEEDLES) {
+  check(!js.includes(n), `dist/index.js has no ${JSON.stringify(n)}`);
+  check(!dts.includes(n), `dist/index.d.ts has no ${JSON.stringify(n)}`);
+}
+const b64 = [...js.matchAll(/['"]([A-Za-z0-9+/]{20000,}={0,2})['"]/g)].map((m) => m[1]);
+check(b64.length === 2, `two embedded WebAssembly modules found in dist/index.js (${b64.length})`);
+const embedded = b64.map((x) => Buffer.from(x, 'base64'));
+for (const [i, mod] of embedded.entries()) {
+  check(
+    mod.length > 1000 && mod.length < 100 * 1024,
+    `embedded module ${i} is under 100 KB (${mod.length} bytes)`,
+  );
+  const text = mod.toString('latin1');
+  for (const n of NEEDLES)
+    check(!text.includes(n), `embedded module ${i} has no ${JSON.stringify(n)}`);
+}
+const shas = embedded.map((m) => createHash('sha256').update(m).digest('hex')).sort();
+const gen = readFileSync(join(repo, 'src', 'wasm', 'ldvec.gen.ts'), 'utf8');
+const want = [...gen.matchAll(/LDVEC_(?:SIMD|SCALAR)_SHA256 = '([0-9a-f]{64})'/g)]
+  .map((m) => m[1])
+  .sort();
+check(
+  JSON.stringify(shas) === JSON.stringify(want),
+  'the embedded modules are the ones src/wasm/ldvec.gen.ts records (sha256)',
+);
+// ... and those equal a fresh remapped build (cargo is incremental, so this is quick after a build).
+try {
+  console.log(node(['scripts/build-wasm.mjs', '--check'], repo).trim().split('\n').pop());
+  check(true, 'the embedded modules equal a fresh path-remapped build (build-wasm --check)');
+} catch (e) {
+  check(
+    false,
+    `build-wasm --check failed: ${String(e.stderr ?? e.message)
+      .split('\n')
+      .slice(-3)
+      .join(' ')}`,
+  );
+}
 const readme = readFileSync(join(installed, 'README.md'), 'utf8');
 for (const phrase of ['Not published yet: the npm scope @airplanemode', 'not tagged'])
   check(readme.includes(phrase), `README says "${phrase}"`);
@@ -174,6 +238,15 @@ const got = await s.get('docs', 'probe-key');
 const removed = await s.delete('docs', 'probe-key');
 const after = await s.get('docs', 'probe-key');
 await s.close();
+const v = await createStore({ driver: 'memory' });
+await v.putVectors('docs', [
+  { key: 'alpha', vector: new Float32Array([1, 0, 0]), value: 'first chunk' },
+  { key: 'bravo', vector: new Float32Array([0, 1, 0]) },
+  { key: 'charlie', vector: new Float32Array([0.7, 0.7, 0]) },
+]);
+const hits = await v.query('docs', new Float32Array([1, 0.1, 0]), 3);
+const info = await v.indexInfo('docs');
+await v.close();
 console.log(JSON.stringify({
   driver: s.driver,
   got,
@@ -181,6 +254,10 @@ console.log(JSON.stringify({
   after: after ?? null,
   events: events.map((e) => [e.name, e.attrs.outcome]),
   leaked: JSON.stringify(events).includes('probe-key'),
+  keys: hits.map((h) => h.key),
+  firstValue: hits[0]?.value ?? null,
+  rows: info?.rows,
+  kernel: info?.kernel,
 }));
 `;
 writeFileSync(join(fresh, 'probe.mjs'), probe);
@@ -202,6 +279,13 @@ check(
   'the installed copy emits storage.set, get, delete and get (miss) events',
 );
 check(r.leaked === false, 'no key appears in an emitted event');
+check(
+  JSON.stringify(r.keys) === JSON.stringify(['alpha', 'charlie', 'bravo']) &&
+    r.firstValue === 'first chunk' &&
+    r.rows === 3 &&
+    (r.kernel === 'simd' || r.kernel === 'scalar'),
+  `putVectors of 3 rows and a query from the installed copy print the keys ${JSON.stringify(r.keys)} (kernel ${r.kernel})`,
+);
 
 const summary = {
   tarball: packed.filename,
@@ -210,6 +294,8 @@ const summary = {
   unpackedBytes: packed.unpackedSize,
   files,
   installedPackages: deps,
+  queryKeys: r.keys,
+  embeddedModuleSha256: shas,
   checks: failures.length === 0 ? 'all passed' : failures,
 };
 writeFileSync(join(scratch, 'pack-check.json'), `${JSON.stringify(summary, null, 2)}\n`);
