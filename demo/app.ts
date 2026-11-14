@@ -1,8 +1,9 @@
 // Public demo for @airplanemode/localdata. Bundled by demo/build.mjs into demo/dist/app.js. It
 // exercises the SDK's set/get/delete/list/usage surface against the OPFS, IndexedDB and memory
 // drivers, lists the storage.* events the SDK emits to an EventSink, shows
-// navigator.storage.estimate() and persist(), calls the not-yet-implemented query() so the error is
-// visible, and fills quota with synthetic data under the namespace demo-fill.
+// navigator.storage.estimate() and persist(), builds and queries a flat vector index of synthetic rows
+// (namespace demo-vectors) with a cold-query measurement and a check against the naive reference, and
+// fills quota with synthetic data under the namespace demo-fill.
 // It makes no network request and touches no storage outside localdata's own OPFS directory and
 // IndexedDB database (airplanemode-localdata).
 import {
@@ -16,6 +17,8 @@ import {
   type LocalData,
   type StorableValue,
 } from '../src/index.ts';
+import { topKRef } from '../src/vec/reference.ts';
+import { DIM, synthKey, synthQuery, synthRows, synthVector } from '../bench/synth.ts';
 
 type DriverName = 'opfs' | 'indexeddb' | 'memory';
 
@@ -58,8 +61,21 @@ const ui = {
   persisted: el<HTMLTableCellElement>('persisted'),
   persist: el<HTMLButtonElement>('persist'),
   persistResult: el<HTMLSpanElement>('persist-result'),
-  queryBtn: el<HTMLButtonElement>('query-btn'),
-  queryOut: el<HTMLPreElement>('query-out'),
+  vecRows: el<HTMLSelectElement>('vec-rows'),
+  vecBuild: el<HTMLButtonElement>('vec-build'),
+  vecReload: el<HTMLButtonElement>('vec-reload'),
+  vecCold: el<HTMLButtonElement>('vec-cold'),
+  vecDelete: el<HTMLButtonElement>('vec-delete'),
+  vecStatus: el<HTMLParagraphElement>('vec-status'),
+  vecFacts: el<HTMLTableElement>('vec-facts'),
+  vecWhich: el<HTMLTableCellElement>('vec-which'),
+  vecTime: el<HTMLTableCellElement>('vec-time'),
+  vecKernel: el<HTMLTableCellElement>('vec-kernel'),
+  vecHeap: el<HTMLTableCellElement>('vec-heap'),
+  vecWasm: el<HTMLTableCellElement>('vec-wasm'),
+  vecBytes: el<HTMLTableCellElement>('vec-bytes'),
+  vecMatch: el<HTMLTableCellElement>('vec-match'),
+  vecHits: el<HTMLOListElement>('vec-hits'),
   fillStart: el<HTMLButtonElement>('fill-start'),
   fillStop: el<HTMLButtonElement>('fill-stop'),
   fillClear: el<HTMLButtonElement>('fill-clear'),
@@ -273,8 +289,7 @@ function setStoreButtons(): void {
   ui.close.disabled = !open;
   ui.driver.disabled = open;
   ui.quota.disabled = open;
-  for (const b of [ui.set, ui.get, ui.del, ui.list, ui.usage, ui.queryBtn, ui.fillClear])
-    b.disabled = !open;
+  for (const b of [ui.set, ui.get, ui.del, ui.list, ui.usage, ui.fillClear]) b.disabled = !open;
   ui.fillStart.disabled = !open || filling;
 }
 
@@ -438,14 +453,147 @@ function sizeOf(v: unknown): number {
 
 // ----- query() -------------------------------------------------------------------------------
 
-function wireQuery(): void {
-  ui.queryBtn.addEventListener('click', () =>
-    withStore(ui.queryOut, async (s) => {
-      const ns = ui.ns.value;
-      const hits = await s.query(ns, new Float32Array(4), 1);
-      return `unexpected: query() resolved with ${hits.length} hit(s)`;
-    }),
-  );
+// ----- vector index --------------------------------------------------------------------------
+
+// Its own store (driver 'auto': OPFS, else IndexedDB), independent of the Store section above, closed
+// after every action so that a page reload followed by Cold query is a genuinely cold open. Rows
+// come from bench/synth.ts, the generator the benchmark and the tests use; the answer is checked
+// against src/vec/reference.ts, the Math.fround reference, after the timing.
+
+const VEC_NS = 'demo-vectors';
+const VEC_CHUNK_BYTES = 256;
+let vecBusy = false;
+let vecQueriesSincePageLoad = 0;
+
+function vecSetBusy(busy: boolean): void {
+  vecBusy = busy;
+  for (const b of [ui.vecBuild, ui.vecReload, ui.vecCold, ui.vecDelete]) b.disabled = busy;
+  ui.vecRows.disabled = busy;
+}
+
+async function vecOpen(): Promise<LocalData> {
+  return createStore({ driver: 'auto', events: eventSink });
+}
+
+interface HeapMemory {
+  memory?: { usedJSHeapSize: number };
+}
+
+function heapNow(): string {
+  const m = (performance as unknown as HeapMemory).memory;
+  return m ? fmtBytes(m.usedJSHeapSize) : 'n/a (performance.memory is Chrome-only)';
+}
+
+async function vecRun(action: () => Promise<void>): Promise<void> {
+  if (vecBusy) return;
+  vecSetBusy(true);
+  try {
+    await action();
+  } catch (e) {
+    ui.vecStatus.textContent = `[${stamp()}] ${showError(e)}`;
+  } finally {
+    vecSetBusy(false);
+    void refreshStoragePanel();
+  }
+}
+
+async function vecBuild(): Promise<void> {
+  const rows = Number(ui.vecRows.value);
+  if (![10_000, 100_000].includes(rows)) throw new Error('rows must be 10,000 or 100,000');
+  const s = await vecOpen();
+  try {
+    ui.vecStatus.textContent = `[${stamp()}] building ${rows.toLocaleString('en-US')} rows on ${s.driver} (replaces the previous index)...`;
+    await s.clear(VEC_NS);
+    const t0 = performance.now();
+    const res = await s.putVectors(VEC_NS, synthRows(0, rows, { chunkBytes: VEC_CHUNK_BYTES }));
+    const ms = performance.now() - t0;
+    const info = await s.indexInfo(VEC_NS);
+    ui.vecStatus.textContent =
+      `[${stamp()}] built ${res.rows.toLocaleString('en-US')} rows (dim ${DIM}, ${VEC_CHUNK_BYTES}-byte chunks) on ${s.driver} in ${ms.toFixed(0)} ms; ` +
+      `index ${fmtBytes(info?.bytes ?? 0)}, ${info?.segments ?? 0} segment(s). ` +
+      'Press "Reload page", then "Cold query".';
+  } finally {
+    await s.close();
+  }
+}
+
+async function vecColdQuery(): Promise<void> {
+  const cold = vecQueriesSincePageLoad === 0;
+  vecQueriesSincePageLoad++;
+  const t0 = performance.now();
+  const s = await vecOpen();
+  try {
+    const info = await s.indexInfo(VEC_NS);
+    if (!info) {
+      ui.vecStatus.textContent = `[${stamp()}] no index in this browser: press Build first.`;
+      ui.vecFacts.hidden = true;
+      ui.vecHits.replaceChildren();
+      return;
+    }
+    const hits = await s.query(VEC_NS, synthQuery(0), 10);
+    const ms = performance.now() - t0;
+    ui.vecFacts.hidden = false;
+    ui.vecWhich.textContent = cold
+      ? 'cold: the first thing this page load did (the OS file cache is not dropped)'
+      : 'warm: the store was reopened in a page that already ran a query';
+    ui.vecTime.textContent = `${ms.toFixed(1)} ms (createStore, index open, first query, k = 10)`;
+    ui.vecKernel.textContent = `${info.kernel}, ${info.rows.toLocaleString('en-US')} rows, ${info.segments} segment(s), dim ${info.dim}`;
+    ui.vecHeap.textContent = heapNow();
+    ui.vecWasm.textContent = fmtBytes(s.vectorWasmBytes());
+    ui.vecBytes.textContent = `${fmtBytes(info.bytes)} (${info.bytes} bytes)`;
+    ui.vecMatch.textContent = 'checking against the naive reference...';
+    const items = hits.map((h) => {
+      const li = document.createElement('li');
+      const preview = typeof h.value === 'string' ? h.value.slice(0, 40) : '';
+      li.textContent = `${h.key}  score ${h.score}  ${JSON.stringify(preview)}`;
+      return li;
+    });
+    ui.vecHits.replaceChildren(...items);
+    ui.vecStatus.textContent = `[${stamp()}] query answered; checking it against the reference (slow for 100,000 rows)...`;
+    // After the timing: the same query scored by the Math.fround reference, row by row, nothing kept
+    // but a key and a score per row.
+    await new Promise((r) => setTimeout(r, 0));
+    const rows = info.rows;
+    const want = topKRef(
+      (function* () {
+        for (let i = 0; i < rows; i++) yield { key: synthKey(i), vector: synthVector(i) };
+      })(),
+      synthQuery(0),
+      10,
+      'cosine',
+    );
+    const same =
+      want.length === hits.length &&
+      want.every((w, i) => w.key === hits[i]!.key && Object.is(w.score, hits[i]!.score));
+    ui.vecMatch.textContent = same ? 'yes' : 'no';
+    ui.vecStatus.textContent = `[${stamp()}] Matches naive reference: ${same ? 'yes' : 'no'}.`;
+  } finally {
+    await s.close();
+  }
+}
+
+async function vecDelete(): Promise<void> {
+  const s = await vecOpen();
+  try {
+    const before = await s.indexInfo(VEC_NS);
+    await s.clear(VEC_NS);
+    ui.vecFacts.hidden = true;
+    ui.vecHits.replaceChildren();
+    ui.vecStatus.textContent = `[${stamp()}] index deleted${before ? ` (${fmtBytes(before.bytes)} freed)` : ' (there was none)'}.`;
+  } finally {
+    await s.close();
+  }
+}
+
+function wireVectors(): void {
+  ui.vecBuild.addEventListener('click', () => void vecRun(vecBuild));
+  ui.vecReload.addEventListener('click', () => location.reload());
+  ui.vecCold.addEventListener('click', () => void vecRun(vecColdQuery));
+  ui.vecDelete.addEventListener('click', () => void vecRun(vecDelete));
+  if (!opfsAvailable() && !indexedDbAvailable()) {
+    ui.vecStatus.textContent = 'Neither OPFS nor IndexedDB is available in this browser.';
+    vecSetBusy(true);
+  }
 }
 
 // ----- quota fill ----------------------------------------------------------------------------
@@ -567,7 +715,7 @@ function wire(): void {
   ui.open.addEventListener('click', () => void openStore());
   ui.close.addEventListener('click', () => void closeStore());
   wireKv();
-  wireQuery();
+  wireVectors();
   ui.persist.addEventListener('click', async () => {
     try {
       const granted = await navigator.storage.persist();

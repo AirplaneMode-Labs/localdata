@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
     />
     <title>localdata demo</title>
     <link rel="icon" href="data:," />
@@ -19,9 +19,11 @@
         page's own files.
       </p>
       <p class="status-line" id="sprint-status">
-        Sprint 3 (14 Nov 2026). set/get/delete/list over OPFS, IndexedDB or memory, with
-        storage.set, storage.get, storage.delete and storage.quota events through an optional sink,
-        listed live below; query() not_implemented naming Sprint 4.
+        Sprint 4 (14 Nov 2026). A flat vector index in OPFS or IndexedDB: build 10,000 or 100,000
+        synthetic rows, reload the page, run a cold query and see the measured time and a match
+        against the naive reference; set/get/delete/list and the storage.* events, now including
+        storage.query, storage.index.open and storage.index.write. Measured on an Apple M5 Pro 48
+        GB; not measured on 8 GB.
       </p>
       <p class="status-line">
         Built from main at <code id="build-sha" data-sha="__BUILD_SHA__">local</code> by
@@ -61,13 +63,15 @@
         <h2>What this demo does not do yet</h2>
         <ul>
           <li>
-            <code>query()</code> rejects with <code>StorageError</code> code
-            <code>not_implemented</code>; the vector index lands in Sprint 4 (design note:
-            <a href="https://github.com/AirplaneMode-Labs/localdata/blob/main/docs/vector-index.md"
-              >docs/vector-index.md</a
-            >).
+            Not yet: HNSW (Sprint 6), quantisation, compaction, multi-tab writers beyond one writer
+            at a time, encryption at rest, storage events in the Airplane Mode DevTools panel
+            (Sprint 5), an 8 GB laptop measurement.
           </li>
-          <li>There is no vector index and no similarity search of any kind (Sprint 4).</li>
+          <li>
+            The vector index is a flat scan: every query scores every row. The figures on this page
+            are measured in this tab on this device; the README figures are from an Apple M5 Pro 48
+            GB and nothing here is an 8 GB figure.
+          </li>
           <li>
             The <code>storage.*</code> events reach only the list on this page: it registers an
             <code>EventSink</code> and renders what it receives. This page does not load the
@@ -77,8 +81,9 @@
           </li>
           <li>Not published: the npm scope and package name are not reserved; not tagged.</li>
           <li>
-            No cross-tab coordination: two tabs writing the same namespace can leave the accounting
-            record stale until the next read repairs it.
+            The key-value side has no cross-tab coordination: two tabs writing the same namespace
+            can leave the accounting record stale until the next read repairs it. (The vector index
+            takes a Web Lock per namespace.)
           </li>
           <li>
             Chrome under-reports IndexedDB usage in <code>estimate()</code>, so the browser figure
@@ -177,16 +182,61 @@
         <ol id="events-list" class="events" aria-live="polite"></ol>
       </section>
 
-      <section id="query" class="box">
-        <h2>query(): not implemented (Sprint 4)</h2>
-        <p>
-          Calls <code>store.query(ns, new Float32Array(4), 1)</code> and prints the error the SDK
-          throws, verbatim.
+      <section id="vectors" class="box">
+        <h2>Vector index</h2>
+        <!-- prettier-ignore -->
+        <p>Deterministic synthetic vectors (dimension 384) with 256-byte synthetic chunks, written with <code>putVectors</code> into the namespace <code>demo-vectors</code> on OPFS (IndexedDB when OPFS is missing). No real documents and no model.</p>
+        <p id="vec-warning" class="muted">
+          100k rows use about <span id="vec-mb">__INDEX_MB__</span> MB of this browser's storage
+          (shared with other Airplane Mode Labs demos on this origin); Delete index removes it.
         </p>
         <div class="row">
-          <button id="query-btn" type="button">Call query()</button>
+          <label for="vec-rows">Rows</label>
+          <select id="vec-rows">
+            <option value="10000" selected>10,000</option>
+            <option value="100000">100,000</option>
+          </select>
+          <button id="vec-build" type="button">Build</button>
+          <button id="vec-reload" type="button">Reload page</button>
+          <button id="vec-cold" type="button">Cold query</button>
+          <button id="vec-delete" type="button">Delete index</button>
         </div>
-        <pre id="query-out" class="out" aria-live="polite"></pre>
+        <p id="vec-status" class="mono" aria-live="polite"></p>
+        <table class="kv-table" id="vec-facts" hidden>
+          <tbody>
+            <tr>
+              <th scope="row">Query</th>
+              <td id="vec-which">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Time (createStore to first answer)</th>
+              <td id="vec-time">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Kernel, rows</th>
+              <td id="vec-kernel">-</td>
+            </tr>
+            <tr>
+              <th scope="row">JS heap: approximate (performance.memory)</th>
+              <td id="vec-heap">-</td>
+            </tr>
+            <tr>
+              <th scope="row">WASM memory</th>
+              <td id="vec-wasm">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Index bytes</th>
+              <td id="vec-bytes">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Matches naive reference</th>
+              <td id="vec-match">-</td>
+            </tr>
+          </tbody>
+        </table>
+        <ol id="vec-hits" class="events" aria-live="polite"></ol>
+        <!-- prettier-ignore -->
+        <p class="muted">Measured in this tab on this device. The README figure is from an Apple M5 Pro 48 GB; not measured on 8 GB.</p>
       </section>
 
       <section id="fill" class="box">

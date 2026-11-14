@@ -258,3 +258,11 @@ a {
 .events li[data-level='debug'] {
   color: var(--muted);
 }
+
+#vec-hits:empty::before {
+  content: 'No answer yet. Build an index, reload the page, then press Cold query.';
+}
+
+#vec-facts[hidden] {
+  display: none;
+}
