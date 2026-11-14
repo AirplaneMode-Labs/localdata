@@ -19,3 +19,4 @@ coverage/
 # browser test caches and local scratch
 .playwright/
 .scratch/
+*.tgz

@@ -7,3 +7,4 @@ package-lock.json
 CHANGELOG.md
 src/contracts/
 demo/dist/
+*.tgz

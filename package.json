@@ -18,7 +18,8 @@
     }
   },
   "files": [
-    "dist",
+    "dist/index.js",
+    "dist/index.d.ts",
     "LICENSE",
     "NOTICE",
     "README.md"
@@ -39,7 +40,7 @@
     "browser"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup --no-sourcemap",
     "build:harness": "node test/browser/serve.mjs --build-only",
     "demo:build": "node demo/build.mjs",
     "test": "vitest run",
@@ -49,7 +50,8 @@
     "fmt:check": "prettier --check .",
     "deps:scripts": "npm query ':attr(scripts,[postinstall]),:attr(scripts,[preinstall])'",
     "sync-contracts": "node scripts/sync-contracts.mjs",
-    "ci": "npm run fmt:check && npm run typecheck && npm run test && npm run build"
+    "ci": "npm run fmt:check && npm run typecheck && npm run test && npm run build",
+    "pack:check": "node scripts/pack-check.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
