@@ -36,6 +36,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<StorageErrorCode>([
   'driver_unavailable',
   'io',
   'closed',
+  'corrupt',
 ]);
 const DRIVER_NAMES: ReadonlySet<string> = new Set(['opfs', 'indexeddb', 'memory']);
 
@@ -114,6 +115,15 @@ export class StorageEvents {
     return this.sink !== undefined;
   }
 
+  /**
+   * True while the sink is being called. An operation that STARTS inside a sink call is "nested":
+   * its events are dropped for its whole lifetime, even if they would be emitted after an await,
+   * so a sink that calls back into the store can never feed itself.
+   */
+  get nested(): boolean {
+    return this.emitting;
+  }
+
   /** Start time for a duration; 0 (and no clock read) when there is no sink. */
   start(): number {
     return this.sink === undefined ? 0 : monotonicNow();
@@ -131,6 +141,78 @@ export class StorageEvents {
   delete(startedAt: number, ns: string, outcome: DeleteOutcome): void {
     const quiet = outcome === 'removed' || outcome === 'absent';
     this.timing('storage.delete', startedAt, ns, outcome, quiet ? 'debug' : 'warn');
+  }
+
+  /**
+   * storage.query. Never the query vector, filterPrefix, keys, scores or values. `kernel` is the
+   * scan kernel in use, or 'none' when no kernel had been created.
+   */
+  query(
+    startedAt: number,
+    ns: string,
+    outcome: string,
+    k: number,
+    candidates: number,
+    metric: string,
+    kernel: string,
+  ): void {
+    this.timing(
+      'storage.query',
+      startedAt,
+      ns,
+      outcome,
+      outcome === 'ok' ? 'debug' : 'warn',
+      undefined,
+      {
+        k: Number.isInteger(k) ? k : -1,
+        candidates,
+        metric,
+        kernel,
+      },
+    );
+  }
+
+  /** storage.index.open: one event per load of an index (HEAD and META, and vectors when loaded). */
+  indexOpen(
+    startedAt: number,
+    ns: string,
+    outcome: string,
+    rows: number,
+    segments: number,
+    reason: string,
+    kernel: string,
+    bytes: number,
+  ): void {
+    this.timing(
+      'storage.index.open',
+      startedAt,
+      ns,
+      outcome,
+      outcome === 'ok' || outcome === 'absent' ? 'debug' : 'warn',
+      bytes,
+      { rows, segments, reason, kernel },
+    );
+  }
+
+  /** storage.index.write: putVectors, and a vector delete (replaced 0). */
+  indexWrite(
+    startedAt: number,
+    ns: string,
+    outcome: string,
+    rows: number,
+    replaced: number,
+    segments: number,
+    bytes: number,
+  ): void {
+    this.timing(
+      'storage.index.write',
+      startedAt,
+      ns,
+      outcome,
+      outcome === 'ok' ? 'debug' : 'warn',
+      bytes,
+      { rows, replaced, segments },
+    );
   }
 
   /**
@@ -163,13 +245,14 @@ export class StorageEvents {
     outcome: string,
     level: EventLevel,
     bytes?: number,
+    extra?: EventAttrs,
   ): void {
     if (this.sink === undefined) return;
     this.deliver(
       'timing',
       name,
       level,
-      { ns: validNs(ns), driver: this.driver, outcome },
+      { ns: validNs(ns), driver: this.driver, outcome, ...(extra ?? {}) },
       Math.max(0, monotonicNow() - startedAt),
       bytes,
     );

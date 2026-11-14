@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { createStore } from '../src/index';
-import { runQuerySuite } from './query.behaviour';
+import { MemoryDriver } from '../src/drivers/memory';
+import { queryCases, runQuerySuite } from './query.behaviour';
 import { behaviourCases, runSuite, type MakeStore } from './storage.behaviour';
+import { runVectorSuite, vectorCases, type VectorEnv } from './vector.behaviour';
 
 const makeStore: MakeStore = (opts) => createStore({ driver: 'memory', ...(opts ?? {}) });
 
@@ -15,7 +17,37 @@ describe('behavioural suite (memory driver)', () => {
 });
 
 describe('query() suite (memory driver)', () => {
-  runQuerySuite(makeStore, it, it.skip);
+  it('has the 13 Sprint 2 cases, none skipped, with unique names', () => {
+    expect(queryCases.length).toBe(13);
+    expect(new Set(queryCases.map((c) => c.name)).size).toBe(13);
+  });
+
+  runQuerySuite(makeStore, it);
+});
+
+/** Memory storage that survives a store being closed and opened again, like a reload. */
+function memoryVectorEnv(): VectorEnv {
+  let driver = new MemoryDriver();
+  return {
+    makeStore: async (opts) => {
+      driver = new MemoryDriver();
+      return createStore({ driver, ...(opts ?? {}) });
+    },
+    reopen: async (opts) => createStore({ driver, ...(opts ?? {}) }),
+    raw: async () => {
+      await driver.open();
+      return driver;
+    },
+  };
+}
+
+describe('vector suite (memory driver)', () => {
+  it('has at least 15 cases with unique names', () => {
+    expect(vectorCases.length).toBeGreaterThanOrEqual(15);
+    expect(new Set(vectorCases.map((c) => c.name)).size).toBe(vectorCases.length);
+  });
+
+  runVectorSuite(memoryVectorEnv(), (name, fn) => it(name, fn, 60_000));
 });
 
 describe('createStore', () => {

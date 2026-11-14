@@ -2,7 +2,13 @@
 // keyPath [ns, key] and an index 'ns'. Values are stored whole as ArrayBuffer (no chunking).
 import { StorageError } from '../contracts/storage-api';
 import { toStorageError } from '../errors';
-import { STORAGE_ROOT, type DriverPutMeta, type DriverRecord, type StorageDriver } from './types';
+import {
+  STORAGE_ROOT,
+  type DriverHooks,
+  type DriverPutMeta,
+  type DriverRecord,
+  type StorageDriver,
+} from './types';
 
 const DB_VERSION = 1;
 const STORE = 'kv';
@@ -36,7 +42,7 @@ function nsRange(ns: string): IDBKeyRange {
   return IDBKeyRange.bound([ns], [ns, []]);
 }
 
-export class IndexedDbDriver implements StorageDriver {
+export class IndexedDbDriver implements StorageDriver, DriverHooks {
   readonly name = 'indexeddb' as const;
   private db: IDBDatabase | undefined;
 
@@ -143,6 +149,28 @@ export class IndexedDbDriver implements StorageDriver {
       await txDone(tx);
     } catch (e) {
       throw toStorageError(e, 'indexeddb clear');
+    }
+  }
+
+  async namespaces(): Promise<string[]> {
+    try {
+      const [, store] = this.tx('readonly');
+      return await new Promise((resolve, reject) => {
+        const out: string[] = [];
+        const r = store.index(NS_INDEX).openKeyCursor(null, 'nextunique');
+        r.onsuccess = () => {
+          const cursor = r.result;
+          if (!cursor) {
+            resolve(out.sort());
+            return;
+          }
+          out.push(cursor.key as string);
+          cursor.continue();
+        };
+        r.onerror = () => reject(r.error ?? new Error('IndexedDB cursor failed'));
+      });
+    } catch (e) {
+      throw toStorageError(e, 'indexeddb namespaces');
     }
   }
 

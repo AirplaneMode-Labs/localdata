@@ -19,7 +19,7 @@ function walk(dir: string, out: string[] = []): string[] {
     const p = join(dir, name);
     const rel = relative(repo, p).split(sep).join('/');
     if (
-      /^(node_modules|dist|demo\/dist|test\/browser\/dist|test-results|\.git|evidence)(\/|$)/.test(
+      /^(node_modules|dist|demo\/dist|test\/browser\/dist|test-results|target|\.git|evidence)(\/|$)/.test(
         rel,
       )
     )

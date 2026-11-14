@@ -3,7 +3,13 @@
 // on every mutation with createWritable({ keepExistingData: false }).
 import { StorageError } from '../contracts/storage-api';
 import { toStorageError } from '../errors';
-import { STORAGE_ROOT, type DriverPutMeta, type DriverRecord, type StorageDriver } from './types';
+import {
+  STORAGE_ROOT,
+  type DriverHooks,
+  type DriverPutMeta,
+  type DriverRecord,
+  type StorageDriver,
+} from './types';
 
 const VERSION_DIR = 'v1';
 const INDEX_FILE = 'keys.json';
@@ -30,7 +36,7 @@ function isNotFound(e: unknown): boolean {
   return (e as { name?: unknown } | null)?.name === 'NotFoundError';
 }
 
-export class OpfsDriver implements StorageDriver {
+export class OpfsDriver implements StorageDriver, DriverHooks {
   readonly name = 'opfs' as const;
   private root: FileSystemDirectoryHandle | undefined;
   private readonly indexes = new Map<string, Map<string, IndexEntry>>();
@@ -56,6 +62,25 @@ export class OpfsDriver implements StorageDriver {
   async close(): Promise<void> {
     this.root = undefined;
     this.indexes.clear();
+  }
+
+  /**
+   * Drops the cached keys.json of one namespace. The vector index calls this under its cross-tab
+   * lock so a writer in another tab is seen before this tab reads or rewrites the namespace index.
+   */
+  refreshIndex(ns: string): void {
+    this.indexes.delete(ns);
+  }
+
+  /** Every namespace directory under the root. */
+  async namespaces(): Promise<string[]> {
+    try {
+      const out: string[] = [];
+      for await (const name of this.rootDir().keys()) out.push(name);
+      return out.sort();
+    } catch (e) {
+      throw toStorageError(e, 'opfs namespaces');
+    }
   }
 
   private rootDir(): FileSystemDirectoryHandle {

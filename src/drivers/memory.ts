@@ -1,5 +1,5 @@
 import { StorageError } from '../contracts/storage-api';
-import type { DriverPutMeta, DriverRecord, StorageDriver } from './types';
+import type { DriverHooks, DriverPutMeta, DriverRecord, StorageDriver } from './types';
 
 interface Row {
   bytes: Uint8Array;
@@ -7,7 +7,7 @@ interface Row {
 }
 
 /** In-memory driver for tests and non-browser environments. Bytes are copied on put and get. */
-export class MemoryDriver implements StorageDriver {
+export class MemoryDriver implements StorageDriver, DriverHooks {
   readonly name = 'memory' as const;
   private readonly spaces = new Map<string, Map<string, Row>>();
   private opened = false;
@@ -70,6 +70,11 @@ export class MemoryDriver implements StorageDriver {
   async clear(ns: string): Promise<void> {
     this.ensureOpen();
     this.spaces.delete(ns);
+  }
+
+  async namespaces(): Promise<string[]> {
+    this.ensureOpen();
+    return [...this.spaces.keys()].sort();
   }
 
   async usage(ns?: string): Promise<{ bytes: number; items: number }> {

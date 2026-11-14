@@ -1,11 +1,13 @@
-// @airplanemode/localdata: set/get/delete/query over OPFS with an IndexedDB fallback.
-// Implements the Storage API contract 0.1.0 vendored from AirplaneMode-Labs/runtime spec/.
+// @airplanemode/localdata: set/get/delete/query over OPFS with an IndexedDB fallback, plus a flat
+// vector index (putVectors/query) persisted beside the values.
+// Implements the Storage API contract 0.2.0 vendored from AirplaneMode-Labs/runtime spec/.
 import { StorageError, type StorageDriver } from './contracts/storage-api';
 import { IndexedDbDriver } from './drivers/indexeddb';
 import { MemoryDriver } from './drivers/memory';
 import { OpfsDriver } from './drivers/opfs';
 import type { EventSink } from './contracts/event';
 import { LocalData, type LocalDataOptions } from './store';
+import type { KernelChoice } from './vec/kernel';
 
 export * from './contracts/storage-api';
 export {
@@ -17,10 +19,12 @@ export {
   type StorageEventName,
 } from './contracts/event';
 export { LocalData, validateKey, validateNamespace, type LocalDataOptions } from './store';
+export { DEFAULT_MAX_INDEX_BYTES } from './vec/files';
+export { simdSupported, type KernelChoice, type KernelKind } from './vec/kernel';
 export { MemoryDriver } from './drivers/memory';
 export { OpfsDriver } from './drivers/opfs';
 export { IndexedDbDriver } from './drivers/indexeddb';
-export { META_NS, STORAGE_ROOT } from './drivers/types';
+export { META_NS, STORAGE_ROOT, type DriverHooks } from './drivers/types';
 export { decode, encode } from './codec';
 export { isQuotaError, toStorageError } from './errors';
 
@@ -41,6 +45,10 @@ export interface CreateStoreOptions {
   events?: EventSink;
   /** Session id for events (1..64 chars); pass the runtime's sessionId() to share one id. */
   eventSession?: string;
+  /** Largest vector index (vectors plus META and keys) to write or open, in bytes; default 1 GiB (2^30). */
+  maxIndexBytes?: number;
+  /** Scan kernel: 'auto' (SIMD when WebAssembly SIMD is available, else scalar), 'simd' or 'scalar'. */
+  vectorKernel?: KernelChoice;
 }
 
 export function opfsAvailable(): boolean {
@@ -96,5 +104,7 @@ export async function createStore(opts: CreateStoreOptions = {}): Promise<LocalD
   if (opts.clock !== undefined) ldOpts.clock = opts.clock;
   if (opts.events !== undefined) ldOpts.events = opts.events;
   if (opts.eventSession !== undefined) ldOpts.eventSession = opts.eventSession;
+  if (opts.maxIndexBytes !== undefined) ldOpts.maxIndexBytes = opts.maxIndexBytes;
+  if (opts.vectorKernel !== undefined) ldOpts.vectorKernel = opts.vectorKernel;
   return LocalData.open(ldOpts);
 }

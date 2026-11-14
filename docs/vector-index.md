@@ -1,157 +1,69 @@
-# Vector index design note
+# Vector index
 
-Status: design only. Nothing here is implemented. In Storage API 0.1.0 `query()` throws
-`StorageError` `not_implemented` naming Sprint 4. The test suite for the flat index is already
-written and skipped: `test/query.behaviour.ts` (note: "Sprint 4: flat index"). Every number below is
-either shown arithmetic or marked **target** or **not measured**.
+Status: **flat index implemented** in `0.2.0-alpha.0` (Sprint 4). HNSW is not built (Sprint 6, after a
+build-or-adopt note). The on-disk format is in [vector-index-format.md](vector-index-format.md); the
+behaviour is the normative part of Storage API 0.2.0 (`runtime/spec/storage-api.md`, committed; public
+after the owner's push). The measured figures are in the README Benchmarks block, generated from
+`docs/benchmarks/vector-index.csv`; this page quotes none of them.
 
-## 1. Goals and non-goals
+## 1. What is implemented
 
-- Goal: `query(ns, vector, k, { filterPrefix? })` over the vectors a namespace holds, persisted in
-  OPFS (IndexedDB fallback), reloaded cold after a browser restart.
-- Target (Sprint 4 done-when): a 100,000-chunk index reloads cold and answers its first query in
-  **under 2 seconds on an 8 GB laptop**. **Target, not measured.** No measurement exists yet on the
-  8 GB Windows no-GPU laptop.
-- Non-goals now: quantisation, multi-vector documents, cross-tab writers, encryption at rest.
+- `putVectors(ns, rows)`: all-or-nothing, streaming (an `Iterable` or `AsyncIterable` of
+  `{ key, vector: Float32Array, value? }`), replace-on-key, `dim` fixed by the first successful call.
+- `query(ns, vector, k, { metric?, filterPrefix?, values? })`: exact top-k by cosine (default) or dot,
+  score descending then key ascending by UTF-8 bytes, `[]` for a namespace without an index.
+- `indexInfo(ns)`, `usage(ns)` with `vectorRows` and `vectorBytes`, `delete(ns, key)` (a tombstone),
+  `clear(ns)`.
+- Scores are IEEE binary32, four accumulators, no fused multiply-add: the SIMD WebAssembly module, the
+  scalar module and the `Math.fround` reference (`src/vec/reference.ts`) agree bit for bit, so a result is
+  reproducible across machines and browsers.
+- Crash safety and corruption handling: parts first, HEAD last; every part is checksummed (CRC-32C) and
+  size-checked; a failed check rejects with `corrupt` and never returns a wrong answer.
+- Cross-tab writers are serialised by a Web Lock per namespace, with the OPFS driver's cache refreshed under
+  it.
+- `maxIndexBytes` (default 1 GiB) bounds what is written and what is opened, checked before any allocation.
 
-## 2. Phase 1: flat index (Sprint 4)
+## 2. Design decisions and why
 
-Exact search: score every candidate, keep the top k. Exact results make it the correctness oracle
-for the later approximate index.
+| Decision                                              | Reason                                                                                                                                                                                                                                                     |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact flat scan first                                 | Exact results are the correctness oracle for the later approximate index, and 100,000 x 384 is small enough to scan in single-digit milliseconds with SIMD (see the benchmark).                                                                            |
+| Scan in Rust compiled to WebAssembly, no wasm-bindgen | Raw `extern "C"` exports keep the module under 100 KB and the boundary a handful of integers; determinism rules (no clock, no hash maps, checked `u64` arithmetic) are easy to hold in about 300 lines with zero dependencies (build-or-adopt rule TD-17). |
+| SIMD and scalar from one source                       | `cfg(target_feature = "simd128")` picks the kernel; both keep lane `j` of four accumulators equal to element `4k + j`, so results are bit-identical and the scalar module is a true fallback.                                                              |
+| Segments, parts and a HEAD written last               | No in-place update means a crash or a quota error can never leave a half-written index visible; the previous HEAD stays valid. 8 MiB parts bound one write and one read at a time.                                                                         |
+| CRC-32C on every part                                 | Detects truncation, torn writes and bit rot cheaply (about the speed of a memory copy with slicing-by-8). It is not a MAC: anyone who can write the profile can recompute it (README Limitations).                                                         |
+| Tombstones, no compaction                             | Keeps writes append-only. Replaced and deleted rows stay on disk until `clear(ns)`, bounded by 4,194,304 rows and 4,096 segments per namespace. Compaction is a recorded follow-up, not a Sprint 4 item.                                                   |
+| Vectors load on the first query                       | `createStore` stays fast and a write-only page never pays for a read. The first query reads and checksums the vector parts (that is what the benchmark's first-query column contains).                                                                     |
+| Values lazy per hit                                   | A 100,000 x 2,048-byte index is 200 MB of text the scan never needs; only the k hits' parts are read (a 16-part LRU).                                                                                                                                      |
 
-- Metrics: cosine (default) and dot. Vectors are stored as written. For cosine, a unit-norm copy is
-  not stored; the query is normalised once and each row's inverse norm is kept in a side array so
-  scoring is one dot product per row.
-- Scoring uses `Float32Array`. Accumulate in f32 in a fixed order (index 0 upward) so results are
-  reproducible on one engine; cross-engine bit equality is not promised.
-- Top-k: a bounded min-heap of size k. Ties break by key in UTF-8 byte order (ascending), so output
-  is deterministic. `k = 0` returns `[]`; `k` above the count returns every candidate; non-integer,
-  negative or non-finite `k` throws `invalid_value`.
-- Zero vector under cosine: score 0, never NaN.
-- Dimension is fixed per namespace by the first vector written; a different length throws
-  `invalid_value`.
-- `filterPrefix` is applied while scanning (rows whose key lacks the prefix are skipped).
-- Cost: O(n x d) per query. At n = 100,000 and d = 384 that is 38,400,000 multiply-adds, which is
-  the expected order of tens of milliseconds in plain JS or WASM SIMD. **Not measured.**
+## 3. Not built
 
-## 3. Phase 2: HNSW in Rust compiled to WASM (Sprint 6)
+- HNSW or any approximate search (Sprint 6, after a written build-or-adopt note). Recall would be judged
+  against this flat index on the same data.
+- Quantisation (f16 or int8 would halve or quarter the resident size), compaction, multi-vector documents,
+  encryption at rest, a TTL for vector rows.
+- Reading with `FileSystemSyncAccessHandle` in a worker (the index is read through `getFile()`), and any
+  threaded WebAssembly (GitHub Pages cannot send COOP/COEP).
+- Storage events in the Airplane Mode DevTools panel (Sprint 5), embeddings through the worker host
+  (Sprint 5).
 
-Approximate search for namespaces where the flat scan is too slow.
+## 4. How it was measured, and what is not measured
 
-- Implementation: a Rust crate compiled to `wasm32-unknown-unknown`, built with the lab's pinned
-  `wasm-bindgen` and `wasm-opt`. No threads (Pages cannot send COOP/COEP). The crate follows the
-  lab's Rust determinism rules: no `HashMap`/`HashSet`, no clock, environment or filesystem reads.
-- Seeded level draw: each node's level is drawn from a seeded PRNG (a fixed algorithm such as
-  SplitMix64 stored in `header.json` together with the seed), with `level = floor(-ln(u) * mL)`
-  and `mL = 1 / ln(M)`. Same seed plus same insertion order gives the same graph, which makes the
-  index testable and the file reproducible. The logarithm is computed in integer or fixed-point
-  arithmetic, or from a pinned table, rather than platform libm.
-- Parameters (starting points, to be tuned): M = 16, efConstruction = 200, efSearch = 64.
-- Recall is judged against the flat index on the same data. The recall figure is **not measured**.
-- Graph memory, shown: level 0 keeps up to 2M = 32 neighbours of 4 bytes each, so 32 x 4 = 128 B
-  per node, 100,000 x 128 B = 12.8 MB. Upper levels hold about 1/(M-1) = 1/15 of the nodes, adding
-  roughly 6 percent, so about 13.6 MB in total.
+`npm run bench:vectors` (`bench/vector-bench.spec.ts`) builds 10,000 and 100,000 x 384 indexes from
+deterministic synthetic vectors and chunks (`bench/synth.ts`: no real documents, no model download), closes
+the page, and times a cold `createStore` plus first `query(k = 10)` in fresh pages, five times, then once
+after relaunching Chrome on the same profile, then fifty more queries for p50 and p95. Chrome runs with
+`--enable-precise-memory-info`. The CSV's `commit` is `git describe --always --dirty`, its `machine` is
+generated from `os.cpus()` and `os.totalmem()`, and nothing in it or in the README numbers is typed by hand.
 
-## 4. On-disk layout
+Not measured: anything on an 8 GB Windows no-GPU laptop (the owner's step: the same command there), the
+effect of Windows Defender on OPFS and IndexedDB files, behaviour under memory pressure, and the OS file
+cache (it cannot be dropped from a page, so a "cold" run is cold for the page and not for the disk).
 
-### OPFS
+## 5. Memory
 
-Under the existing root `airplanemode-localdata/v1/`:
-
-```
-<ns>/vectors/v1/
-  header.json      format version, dim, metric default, count, live count, seed (HNSW), checksum
-  vectors.f32      count x dim little-endian float32, row-major
-  keys.bin         u32 LE offsets (count + 1) followed by UTF-8 key bytes
-  tombstones.bin   bitset, 1 bit per row, 1 = deleted
-```
-
-- Rows are append-only. `set` of a new key appends a row; `set` of an existing key tombstones the
-  old row and appends a new one (the cheap overwrite). `delete` flips a tombstone bit.
-- Compaction rewrites the files without tombstoned rows when the dead fraction passes a threshold
-  (starting point 25 percent). It writes `v2` beside `v1` and swaps by updating `header.json` last,
-  so a crash leaves a readable `v1`.
-- `header.json` is written last on every commit and carries the row count it vouches for; a reader
-  ignores any bytes past that count. That makes append recovery crash-safe without a journal.
-- Reads use `FileSystemSyncAccessHandle` inside a worker where available (fast, no copies), and
-  `getFile().arrayBuffer()` otherwise. A sync access handle takes an exclusive lock per file, so the
-  index is single-writer; cross-tab coordination stays out of scope until it is designed.
-- The HNSW graph (Sprint 6) adds `graph.bin` beside these files; the flat layout is unchanged.
-
-### IndexedDB fallback
-
-Database `airplanemode-localdata`, a new object store `vec` (a version 2 upgrade of the database),
-keyPath `[ns, part]`. Parts: `header` (the JSON object), `keys` (one ArrayBuffer), `tombstones`
-(one ArrayBuffer) and `vectors:<n>` chunks of 4 MiB each (`4,194,304 / (384 x 4) = 2,730` rows per
-chunk at d = 384). Chunking avoids one 154 MB structured clone per commit.
-
-## 5. Quota accounting
-
-The vector files count against the namespace like any value. `usage(ns)` adds
-`vectors.f32 + keys.bin + tombstones.bin + header.json` (plus `graph.bin` later) to `bytes`, and the
-accounting record under `__ld_meta` gains a `vectorBytes` field. A `set` whose new row would exceed
-`quotaBytes` throws `quota_exceeded` before writing, as for any value. Compaction needs room for
-the new copy, so it reserves the live-row size first and aborts with `quota_exceeded` rather than
-leaving a half-written `v2`.
-
-## 6. Cold-load target and its arithmetic
-
-Reference corpus: 100,000 chunks, d = 384 (a common small sentence-embedding width).
-
-| Item                 | Arithmetic                       | Size                                    |
-| -------------------- | -------------------------------- | --------------------------------------- |
-| `vectors.f32`        | 100,000 x 384 x 4 B              | 153,600,000 B (about 154 MB; 146.5 MiB) |
-| `keys.bin` offsets   | (100,000 + 1) x 4 B              | 400,004 B                               |
-| `keys.bin` key bytes | 100,000 x 32 B (assumed average) | 3,200,000 B                             |
-| `tombstones.bin`     | ceil(100,000 / 8) B              | 12,500 B                                |
-| Flat total           |                                  | about 157.2 MB                          |
-
-Time budget at 2,000 ms, **target**: reading 154 MB in 2 s needs 154 MB / 2 s = 77 MB/s sustained,
-leaving the whole budget for I/O. A real budget should hold the read to about 1,000 ms (about
-154 MB/s) and spend the rest on header parse, key table build and the first query. Typical NVMe
-laptop storage exceeds these rates by a wide margin, but browser OPFS overhead, antivirus on
-Windows and the 8 GB memory ceiling are the unknowns, so all of this is **not measured**.
-
-Memory: the flat index holds `vectors.f32` as one `Float32Array` (154 MB) plus keys; on an 8 GB
-laptop with a browser tab budget that is acceptable, but it is why quantisation (f16 or int8 would
-halve or quarter it) is a recorded follow-up, not a Sprint 4 item.
-
-Measurement command (to be added in Sprint 4; does not exist yet):
-
-```sh
-LOCALDATA_BENCH_OUT=<dir> npm run test:browser -- --grep "vector cold load"
-```
-
-It will build a synthetic 100,000 x 384 index with a seeded generator, close the store, reopen it in
-a fresh browser context (cold: new page, no JS heap reuse; the OS file cache cannot be dropped from
-a page, so the report states warm-OS-cache versus the first run after boot separately), and record
-open time, first-query time and `performance.memory`-class heap figures, with Chrome version and
-machine in the log line. The README Benchmarks table will cite that log. The 8 GB Windows no-GPU
-column stays `not measured` until the owner runs it.
-
-## 7. Proposed contract changes
-
-Storage API 0.1.0 is frozen; these are proposals for the architect, which would be a 0.2.0 change
-published from `runtime/spec` and re-vendored. Until then `test/query.behaviour.ts` uses a local
-helper type and never edits `src/contracts`.
-
-1. `QueryOptions.metric?: 'cosine' | 'dot'`, default `'cosine'`.
-2. Specify that `query()` throws `invalid_value` for an invalid `k` and for a dimension mismatch
-   (0.1.0 only freezes the `not_implemented` behaviour).
-3. Specify tie-breaking (key byte order) and that `score` is the metric value, higher is better.
-4. Optionally `set()` accepting `Float32Array` as a first-class vector value; today a
-   `Float32Array` is stored as an ordinary typed array, so the index must decide which keys are
-   vectors (proposal: a namespace becomes a vector namespace when its first value is a
-   `Float32Array`, and then rejects other value types).
-5. A `createIndex(ns, { dim, metric })` call may be cleaner than inferring dimension from the first
-   write; open question.
-
-## 8. What is measured, and when
-
-| Item                                   | Status               | When                                        |
-| -------------------------------------- | -------------------- | ------------------------------------------- |
-| Flat query behaviour (13 cases)        | written, skipped     | live in Sprint 4                            |
-| Flat scan time at 100k x 384           | not measured         | Sprint 4                                    |
-| Cold load of 100k x 384 (target < 2 s) | target, not measured | Sprint 4, on the 8 GB Windows no-GPU laptop |
-| HNSW recall against flat               | not measured         | Sprint 6                                    |
-| HNSW build time and graph size         | not measured         | Sprint 6                                    |
+Resident while a store lives: the vectors (rows x dim x 4 bytes) in WebAssembly linear memory, which does
+not shrink until the store is closed, plus the keys, the live-key map and a few bytes per row of tables.
+Writing streams rows through one block of at most 8 MiB, so a write holds the caller's rows, the resident
+index and one part, never two copies of the index. The README memory table (index bytes, WebAssembly memory,
+JS heap peak, storage usage) is the measured budget, from the CSV, for the machine named there.

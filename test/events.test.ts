@@ -81,12 +81,15 @@ async function make(
 }
 
 describe('storage.* events: shapes', () => {
-  it('exports STORAGE_EVENT_NAMES with the four names of Event 0.1.2', () => {
+  it('exports STORAGE_EVENT_NAMES with the seven names of Event 0.1.3', () => {
     expect([...STORAGE_EVENT_NAMES]).toEqual([
       'storage.set',
       'storage.get',
       'storage.delete',
       'storage.quota',
+      'storage.query',
+      'storage.index.open',
+      'storage.index.write',
     ]);
   });
 
@@ -346,13 +349,29 @@ describe('storage.* events: failures', () => {
     expect(JSON.stringify(rec.events)).not.toContain('SENTINEL-NS-5d1e');
   });
 
-  it('query() is not a storage event: it stays not_implemented and emits nothing', async () => {
+  it('query() on a namespace with no index resolves [] and emits storage.index.open (absent) then storage.query (0.2.0)', async () => {
     const rec = recorder();
     const store = await make(rec);
-    await expect(store.query('docs', new Float32Array(4), 1)).rejects.toMatchObject({
-      code: 'not_implemented',
-    });
-    expect(rec.events).toEqual([]);
+    await expect(store.query('docs', new Float32Array(4), 1)).resolves.toEqual([]);
+    expect(rec.events.map((e) => e.name)).toEqual(['storage.index.open', 'storage.query']);
+    expect(rec.events[0]!.attrs['outcome']).toBe('absent');
+    expect(rec.events[1]!.attrs['outcome']).toBe('ok');
+    expect(rec.events[1]!.attrs['candidates']).toBe(0);
+    expectValid(rec.events);
+  });
+
+  it('usage(), delete() and the other KV calls emit no storage.index.* event and create no kernel', async () => {
+    const rec = recorder();
+    const store = await make(rec);
+    await store.set('docs', 'k', 1);
+    await store.usage('docs');
+    await store.usage();
+    await store.delete('docs', 'k');
+    await store.clear('docs');
+    expect(rec.names().every((n) => !n.startsWith('storage.index.') && n !== 'storage.query')).toBe(
+      true,
+    );
+    expect(store.vectorWasmBytes()).toBe(0);
   });
 });
 

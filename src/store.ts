@@ -5,6 +5,7 @@ import {
   StorageError,
   type ListOptions,
   type ListResult,
+  type PutVectorsResult,
   type QueryHit,
   type QueryOptions,
   type SetOptions,
@@ -13,9 +14,14 @@ import {
   type StorageDriver,
   type StorageDriverName,
   type UsageResult,
+  type VectorIndexInfo,
+  type VectorRow,
 } from './contracts/storage-api';
 import { META_NS } from './drivers/types';
 import { toStorageError } from './errors';
+import { VectorStore } from './vec';
+import type { KernelChoice } from './vec/kernel';
+import { DEFAULT_MAX_INDEX_BYTES } from './vec/files';
 import type { EventSink } from './contracts/event';
 import {
   StorageEvents,
@@ -40,6 +46,10 @@ export interface LocalDataOptions {
   events?: EventSink;
   /** Session id stamped on events (1..64 chars): pass the runtime's sessionId() to share one id. */
   eventSession?: string;
+  /** Largest vector index (vectors plus META and keys) this store will write or open; default 1 GiB. */
+  maxIndexBytes?: number;
+  /** Scan kernel: 'auto' picks SIMD when WebAssembly SIMD is available, otherwise scalar. */
+  vectorKernel?: KernelChoice;
 }
 
 interface IndexEntry {
@@ -54,11 +64,19 @@ interface MetaRecord {
   k: Record<string, [number, number]>;
 }
 
+/** Namespaces starting with this prefix belong to the SDK ('__ld_meta', '__ld_vec.<ns>'). */
+export const RESERVED_NS_PREFIX = '__ld_';
+
 export function validateNamespace(ns: string): void {
-  if (typeof ns !== 'string' || !STORAGE_NS_PATTERN.test(ns) || ns === META_NS) {
+  if (
+    typeof ns !== 'string' ||
+    !STORAGE_NS_PATTERN.test(ns) ||
+    ns === META_NS ||
+    ns.startsWith(RESERVED_NS_PREFIX)
+  ) {
     throw new StorageError(
       'invalid_namespace',
-      `invalid namespace ${JSON.stringify(ns)}: must match ^[a-z0-9][a-z0-9._-]{0,63}$ and not be reserved`,
+      `invalid namespace ${JSON.stringify(ns)}: must match ^[a-z0-9][a-z0-9._-]{0,63}$ and not be reserved (the prefix ${RESERVED_NS_PREFIX} is reserved)`,
       { ns: typeof ns === 'string' ? ns : String(ns) },
     );
   }
@@ -90,6 +108,7 @@ export class LocalData implements StorageApi {
   private readonly quotaBytes: number | undefined;
   private readonly clock: () => number;
   private readonly ev: StorageEvents;
+  private readonly vec: VectorStore;
   private readonly index = new Map<string, Map<string, IndexEntry>>();
   private closed = false;
 
@@ -99,6 +118,13 @@ export class LocalData implements StorageApi {
     this.quotaBytes = opts.quotaBytes;
     this.clock = opts.clock ?? (() => Date.now());
     this.ev = new StorageEvents(opts.events, opts.driver.name, opts.eventSession);
+    this.vec = new VectorStore({
+      driver: opts.driver,
+      events: this.ev,
+      kernel: opts.vectorKernel ?? 'auto',
+      maxIndexBytes: opts.maxIndexBytes ?? DEFAULT_MAX_INDEX_BYTES,
+      checkSoft: (ns, additional) => this.checkSoftQuota(ns, additional),
+    });
   }
 
   static async open(opts: LocalDataOptions): Promise<LocalData> {
@@ -110,6 +136,22 @@ export class LocalData implements StorageApi {
     }
     const eventProblem = eventOptionProblem(opts);
     if (eventProblem !== undefined) throw new StorageError('invalid_value', eventProblem);
+    if (
+      opts.maxIndexBytes !== undefined &&
+      !(
+        Number.isInteger(opts.maxIndexBytes) &&
+        opts.maxIndexBytes >= 1 &&
+        opts.maxIndexBytes <= 2 ** 31
+      )
+    ) {
+      throw new StorageError('invalid_value', 'maxIndexBytes must be an integer from 1 to 2^31');
+    }
+    if (
+      opts.vectorKernel !== undefined &&
+      !['auto', 'simd', 'scalar'].includes(opts.vectorKernel)
+    ) {
+      throw new StorageError('invalid_value', "vectorKernel must be 'auto', 'simd' or 'scalar'");
+    }
     const store = new LocalData(opts);
     try {
       await opts.driver.open();
@@ -125,6 +167,7 @@ export class LocalData implements StorageApi {
   private async loadIndex(): Promise<void> {
     const namespaces = await this.d.keys(META_NS);
     for (const ns of namespaces) {
+      if (ns.startsWith(RESERVED_NS_PREFIX)) continue;
       const rec = await this.d.getBytes(META_NS, ns);
       const parsed = rec ? parseMeta(rec.bytes) : undefined;
       if (parsed) {
@@ -186,6 +229,26 @@ export class LocalData implements StorageApi {
     return total;
   }
 
+  /** KV bytes plus the vector indexes this store has resident: what the soft quota is measured against. */
+  private usedBytes(): number {
+    return this.totalBytes() + this.vec.residentBytes();
+  }
+
+  /** Throws quota_exceeded when `additionalBytes` more bytes of vector data would pass the soft quota. */
+  private checkSoftQuota(ns: string, additionalBytes: number): void {
+    if (this.quotaBytes === undefined) return;
+    const used = this.usedBytes();
+    const needed = used + additionalBytes;
+    if (needed > this.quotaBytes) {
+      this.ev.quota(ns, used, this.quotaBytes, needed - this.quotaBytes, 'warn');
+      throw new StorageError(
+        'quota_exceeded',
+        `writing the vector index would bring usage to ${needed} bytes, above the configured quota of ${this.quotaBytes}`,
+        { quotaBytes: this.quotaBytes, usage: used, needed, bytes: additionalBytes },
+      );
+    }
+  }
+
   private isExpired(e: IndexEntry): boolean {
     return e.expiresAt !== undefined && e.expiresAt <= this.clock();
   }
@@ -241,15 +304,15 @@ export class LocalData implements StorageApi {
     const m = await this.nsIndex(ns);
     const previous = m.get(key)?.size ?? 0;
     if (this.quotaBytes !== undefined) {
-      const needed = this.totalBytes() - previous + bytes.byteLength;
+      const needed = this.usedBytes() - previous + bytes.byteLength;
       if (needed > this.quotaBytes) {
-        this.ev.quota(ns, this.totalBytes(), this.quotaBytes, needed - this.quotaBytes, 'warn');
+        this.ev.quota(ns, this.usedBytes(), this.quotaBytes, needed - this.quotaBytes, 'warn');
         throw new StorageError(
           'quota_exceeded',
           `writing ${bytes.byteLength} bytes would bring usage to ${needed} bytes, above the configured quota of ${this.quotaBytes}`,
           {
             quotaBytes: this.quotaBytes,
-            usage: this.totalBytes(),
+            usage: this.usedBytes(),
             needed,
             bytes: bytes.byteLength,
           },
@@ -269,7 +332,7 @@ export class LocalData implements StorageApi {
       // The browser (not the SDK soft quota) refused: its limit is unknown, so quota is null and
       // needed is the size of the write, an upper bound for what did not fit.
       if (err.code === 'quota_exceeded') {
-        this.ev.quota(ns, this.totalBytes(), null, bytes.byteLength, 'warn');
+        this.ev.quota(ns, this.usedBytes(), null, bytes.byteLength, 'warn');
       }
       throw err;
     }
@@ -357,14 +420,16 @@ export class LocalData implements StorageApi {
     this.ensureOpen();
     validateNamespace(ns);
     validateKey(key);
+    // The vector row first: a corrupt index rejects before any KV value is touched.
+    const vectorRemoved = await this.vec.deleteKey(ns, key);
     try {
       const m = await this.nsIndex(ns);
       const entry = m.get(key);
       if (entry && this.isExpired(entry)) {
         await this.removeRow(ns, key, m);
-        return false;
+        return vectorRemoved;
       }
-      return await this.removeRow(ns, key, m);
+      return (await this.removeRow(ns, key, m)) || vectorRemoved;
     } catch (e) {
       throw toStorageError(e, 'delete');
     }
@@ -376,19 +441,51 @@ export class LocalData implements StorageApi {
     k: number,
     opts?: QueryOptions,
   ): Promise<QueryHit[]> {
+    const t0 = this.ev.start();
+    try {
+      this.ensureOpen();
+      validateNamespace(ns);
+    } catch (e) {
+      this.ev.query(t0, ns, outcomeOf(e), k, 0, 'cosine', this.vec.kernelInUse() ?? 'none');
+      throw e;
+    }
+    return this.vec.query(ns, vector, k, opts);
+  }
+
+  async putVectors(
+    ns: string,
+    rows: Iterable<VectorRow> | AsyncIterable<VectorRow>,
+  ): Promise<PutVectorsResult> {
+    const t0 = this.ev.start();
+    try {
+      this.ensureOpen();
+      validateNamespace(ns);
+    } catch (e) {
+      this.ev.indexWrite(t0, ns, outcomeOf(e), 0, 0, 0, 0);
+      throw e;
+    }
+    return this.vec.putVectors(ns, rows);
+  }
+
+  async indexInfo(ns: string): Promise<VectorIndexInfo | undefined> {
     this.ensureOpen();
-    void vector;
-    void k;
-    void opts;
-    throw new StorageError(
-      'not_implemented',
-      `query() is not implemented in Storage API 0.1; the vector index lands in Sprint 4 (namespace ${JSON.stringify(ns)})`,
-      { ns, since: '0.1.0', plannedSprint: 4 },
-    );
+    validateNamespace(ns);
+    return this.vec.indexInfo(ns);
+  }
+
+  /** @internal WebAssembly memory held by this store's vector kernel, in bytes (benchmarks, demo). */
+  vectorWasmBytes(): number {
+    return this.vec.wasmMemoryBytes();
+  }
+
+  /** @internal Test hook: the n-th next kernel call (0 = next) traps for real. */
+  armVectorTrapForTest(afterCalls = 0): void {
+    this.vec.armTrapForTest(afterCalls);
   }
 
   async usage(ns?: string): Promise<UsageResult> {
     this.ensureOpen();
+    const nested = this.ev.nested;
     let bytes = 0;
     let items = 0;
     if (ns === undefined) {
@@ -407,8 +504,14 @@ export class LocalData implements StorageApi {
       }
     }
     const out: UsageResult = { bytes, items };
+    const vec = await this.vec.usage(ns);
+    if (vec !== undefined) {
+      out.bytes += vec.bytes;
+      out.vectorRows = vec.rows;
+      out.vectorBytes = vec.bytes;
+    }
     if (this.quotaBytes !== undefined) out.quotaBytes = this.quotaBytes;
-    this.ev.quota(ns ?? '', bytes, this.quotaBytes ?? null, 0, 'debug');
+    if (!nested) this.ev.quota(ns ?? '', out.bytes, this.quotaBytes ?? null, 0, 'debug');
     return out;
   }
 
@@ -422,6 +525,7 @@ export class LocalData implements StorageApi {
     } catch (e) {
       throw toStorageError(e, 'clear');
     }
+    await this.vec.clear(ns);
   }
 
   async list(ns: string, opts?: ListOptions): Promise<ListResult> {
@@ -450,6 +554,7 @@ export class LocalData implements StorageApi {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.vec.close();
     try {
       await this.d.close();
     } catch (e) {

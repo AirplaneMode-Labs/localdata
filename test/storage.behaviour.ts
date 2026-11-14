@@ -415,19 +415,24 @@ export const behaviourCases: SuiteCase[] = [
       }),
   },
   {
-    name: 'query rejects with not_implemented and a message naming Sprint 4',
+    name: 'query on a namespace with no vectors resolves an empty array (0.2.0), with or without options',
     run: (makeStore) =>
       withStore(makeStore, undefined, async (store) => {
-        await rejectsWith(
-          store.query(NS, new Float32Array([0.1, 0.2, 0.3]), 5),
-          'not_implemented',
-          'Sprint 4',
+        await deepEq(await store.query(NS, new Float32Array([0.1, 0.2, 0.3]), 5), [], 'no index');
+        await deepEq(
+          await store.query(NS, new Float32Array(8), 1, { filterPrefix: 'doc/' }),
+          [],
+          'no index with filterPrefix',
         );
-        await rejectsWith(
-          store.query(NS, new Float32Array(8), 1, { filterPrefix: 'doc/' }),
-          'not_implemented',
-          'Sprint 4',
-        );
+      }),
+  },
+  {
+    name: 'a Float32Array passed to set() is an ordinary value: it round-trips and is not indexed (0.2.0)',
+    run: (makeStore) =>
+      withStore(makeStore, undefined, async (store) => {
+        await store.set(NS, 'v', new Float32Array([1, 0, 0]));
+        await deepEq(await store.get(NS, 'v'), new Float32Array([1, 0, 0]), 'round trip');
+        await deepEq(await store.query(NS, new Float32Array([1, 0, 0]), 5), [], 'not indexed');
       }),
   },
   {
