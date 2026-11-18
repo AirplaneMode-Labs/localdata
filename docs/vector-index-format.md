@@ -1,7 +1,9 @@
 # Vector index on-disk format, version 1
 
-Status: implemented in `0.2.0-alpha.0` (Sprint 4). This format is **localdata-internal**: Storage API
-0.2.0 promises only the behaviour in `runtime/spec/storage-api.md`, never these bytes. It is documented
+Status: implemented in `0.2.0-alpha.0` (Sprint 4); unchanged in `0.3.0-alpha.0` (Sprint 5), which adds the
+documents layout of section 8 on top of this very format (no byte of HEAD, META or a part changed, so
+`formatVersion` stays 1 and no old file needs a new reader). This format is **localdata-internal**: Storage API
+0.3.0 promises only the behaviour in `runtime/spec/storage-api.md`, never these bytes. It is documented
 so the two implementations (the TypeScript writer in `src/vec/writer.ts` and the Rust validator in
 `crates/ldvec`) can be checked against each other, and so a corrupt index can be diagnosed. The golden
 fixture `crates/ldvec/tests/fixtures/tiny/` is written by the TypeScript writer and parsed by the Rust
@@ -15,7 +17,7 @@ who can write the browser profile, who can recompute it.
 ## 1. Records and where they live
 
 One index per namespace `ns`, in the reserved driver namespace `'__ld_vec.' + ns` (the prefix `__ld_` is
-rejected for callers). With the OPFS driver each index therefore has its own directory and its own
+rejected for callers); the documents of `ns` use the same format in `'__ld_doc.' + ns` (section 8). With the OPFS driver each index therefore has its own directory and its own
 `keys.json`; with IndexedDB each record is one row of the `kv` store; with the memory driver each is a
 map entry. The records are:
 
@@ -84,11 +86,21 @@ boundary.
 ## 4. Error reasons
 
 `StorageError` code `corrupt` carries `details { ns, file, reason }`; `file` is a record name (never a
-key). For a segment checksum failure (`crc`) it is `vec-<segId>` or `meta-<segId>`, because the CRC covers every part of the segment; for the HEAD checksum it is `head`; value failures name the `val-<segId>/<part>` record. Reasons from the kernel: `magic`, `version`, `dtype`, `dim`, `length`, `crc`, `reserved`, `count`,
+key); `ns` is the caller's namespace, without the `__ld_vec.` or `__ld_doc.` prefix. For a segment checksum failure (`crc`) it is `vec-<segId>` or `meta-<segId>`, because the CRC covers every part of the segment; for the HEAD checksum it is `head`; value failures name the `val-<segId>/<part>` record. Reasons from the kernel: `magic`, `version`, `dtype`, `dim`, `length`, `crc`, `reserved`, `count`,
 `segment_order`, `tombstone_padding`, `offsets`, `utf8`, `key_length`, `too_large`. From the TypeScript
 layer: `missing_part`, `length` (a part with the wrong size), `crc` (a segment's vector or META checksum),
 `duplicate_key` (two live rows with one key), `bad_vector` (a vector part whose checksum is right but
-which holds a non-finite or oversize row), `value_crc`, `value_decode`, `wasm_trap`.
+which holds a non-finite or oversize row), `value_crc`, `value_decode`, `wasm_trap`. From the OPFS driver:
+`keys_json` (S1-092: the namespace's `keys.json`, the record index of the OPFS driver, does not parse, has
+the wrong shape, or lists an entry that is not a 64-hex file name with a size; `file` is `keys.json`). A
+`keys.json` that does not parse in a key-value namespace is still treated as empty (see the README). From
+the documents layer (section 8): `doc_record` and `chunk_record`.
+
+Two further refusals happen before a record is read (S1-092). The HEAD is read with a bound of
+`64 + 32 * 4096 + 524288 + 4` bytes (`too_large`), and every part with the exact length the HEAD implies
+(`length`); the OPFS driver compares `File.size` with that bound and refuses without calling
+`arrayBuffer()`, so a planted oversize or truncated file is never read into memory. IndexedDB and the memory
+driver hand back a whole value and are checked after.
 
 ## 5. The writer
 
@@ -96,7 +108,8 @@ which holds a non-finite or oversize row), `value_crc`, `value_decode`, `wasm_tr
    before the HEAD re-read to after the HEAD put; drop the driver's cached `keys.json` for the index
    namespace (OPFS `refreshIndex`).
 2. Re-read HEAD; reload the resident index if its bytes changed; refuse at generation `0xFFFFFFFF`.
-3. Delete leftover records whose `segId >= nextSegId` (a write that never committed).
+3. Delete leftover records whose `segId >= nextSegId` (a write that never committed). (The sweep on open,
+   section 6, also removes records of segments below `nextSegId` that the HEAD does not list.)
 4. Stream rows: validate each (key rules, dim, duplicate keys within the call); copy vectors into one
    WebAssembly block of at most 8 MiB; when it is full run `ldv_check_rows`, `ldv_inv_norms`, update the
    segment's running vector CRC, check the soft quota and `maxIndexBytes`, `put` the part.
@@ -120,6 +133,17 @@ index is never held twice.
    block.
 5. Values are read lazily, per hit, through a 16-part LRU, and checked against `valueCrcs`.
 
+6. **Sweep on open (T1-S4-08).** Once the index is loaded (and for a namespace that has no HEAD), the
+   reader deletes every part record the HEAD does not reference: the records of a write that never
+   committed, and the old segments a restart (section 8) left behind. The referenced set is computed from
+   the HEAD alone (`referencedRecords`: for each segment the vector parts of `rows` rows of `dim` floats, the
+   META parts of `metaLength(rows, keyBytesLen)` bytes and the value parts of `valueBytesLen` bytes, each cut as in
+   section 1). Records whose name
+   is not a part name are left alone. The sweep takes the writer's Web Lock with `ifAvailable`: if another
+   tab holds it (a writer may be mid-write) nothing is deleted and the read does not wait; HEAD is re-read
+   under the lock and the sweep is skipped when it changed; a delete that fails is skipped. The number of
+   records deleted is the `swept` attr of `storage.index.open`.
+
 A corrupt result is sticky for that HEAD: every vector call on the namespace keeps rejecting until
 `clear(ns)` or a new HEAD is seen. A trap in the kernel discards the WebAssembly instance and everything
 that pointed into it; the next call starts fresh.
@@ -135,3 +159,47 @@ that pointed into it; the next call starts fresh.
 | key                                                                              | 4,096 UTF-8 bytes (and the 1,024 UTF-16 unit KV rule) | `invalid_key`                                                            |
 | value                                                                            | 1 MiB encoded                                         | `invalid_value` `value_size`                                             |
 | generation                                                                       | 0xFFFFFFFE                                            | `invalid_value` `generation`                                             |
+
+## 8. Documents (Storage API 0.3.0)
+
+The documents API stores each document in the document index of its namespace, `'__ld_doc.' + ns`, using
+exactly the format above. Two kinds of row share the index:
+
+| Row    | Key                         | Vector                 | Value (LD1)             |
+| ------ | --------------------------- | ---------------------- | ----------------------- |
+| record | `<docId>`                   | zeros(dim), no meaning | `{ t, h, b, p, a, m? }` |
+| chunk  | `<docId>/<8-digit ordinal>` | the chunk's embedding  | `{ s, e, t, g? }`       |
+
+Record: `t` title, `h` sha256, `b` bytes, `p` pages, `a` createdAt (epoch ms, from the store's clock at the
+commit), `m` meta (optional). Chunk: `s` pageStart, `e` pageEnd, `t` text, `g` gate (optional, stored for the
+application's audit; not returned by `queryChunks`). A docId matches `^[a-z0-9][a-z0-9_-]{0,63}$`, so it never
+contains `/` and a key without `/` is a record.
+
+- **One commit.** `putDocument` streams the chunk rows, then the record row, through the ordinary writer, so the
+  record and every chunk become visible with one HEAD put. A replace tombstones the old record (same key) and
+  every old chunk (`retire`, because the new document may have fewer chunks or different ordinals) in that same
+  HEAD. `deleteDocument` tombstones the record and every chunk in one new HEAD (one generation). A failure at
+  any point before the HEAD put leaves the previous HEAD and so the previous state; the records written so far
+  are deleted best effort and, if that fails, swept on the next open.
+- **The record row's vector** only has to exist: record rows are never candidates. Its length is the index
+  `dim`. While no chunk has fixed a dim (the namespace holds only zero-chunk documents) the index has the
+  placeholder dim 1; a `putDocument` whose first chunk has another dim, when no other document holds chunks,
+  **restarts** the index: one commit whose HEAD lists only new segments (ids from the committed `nextSegId`, so
+  the old HEAD stays valid until the new one lands) and re-emits the other documents' record rows with zero
+  vectors of the new dim. The old segments' parts are unreferenced afterwards and the sweep removes them. If
+  another document holds chunks, a chunk of another dim is `invalid_value` `dim`.
+- **Visibility.** A chunk row whose docId has no record row, and a row whose key this layer does not write, is
+  never a candidate. `DocumentInfo.chunks` counts the live chunk rows of the docId; `dim` is the index dim when
+  `chunks > 0` and 0 otherwise.
+- **Tie order.** The writer's tie order is the key's UTF-8 bytes; the documents order is docId bytes, then
+  ordinal. `docId + '/' + ordinal` is not that order when one docId is a prefix of another (`'/'` sorts after
+  `'-'`), so `queryChunks` breaks ties on `docId + U+0001 + ordinal`, which sorts before every docId character.
+- **Everything read is re-validated.** Record and chunk values are checked with the input rules (types, ranges,
+  meta key grammar, pages within the document's pages) and rebuilt member by member; a failure is `corrupt`
+  (`doc_record`, `chunk_record`), never a half-returned object.
+- **Limits.** The limits of section 7 apply to the whole document index: a record row counts as a row, and
+  every `putDocument` adds at least one segment, so a namespace takes at most 4,096 `putDocument` calls
+  (including replaces) and 4,194,304 rows including dead ones. There is no compaction: `deleteDocument` and a
+  replace only hide data; `clear(ns)` removes the whole `'__ld_doc.' + ns` namespace (an OPFS directory, the
+  IndexedDB rows, the memory map) and is the physical delete. An application that wants Delete to be physical
+  keeps one namespace per document.

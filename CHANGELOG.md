@@ -7,6 +7,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0-alpha.0] - 2026-11-18 (untagged)
+
+Sprint 5 (D4). Ids: `D4-0x` are Sprint 5 items; `S1-0xx` and `S1-1xx` are security-consultant findings;
+`T1-S4-08` and `BUG-T2-S4-22` are Sprint 4 tester findings. Storage API 0.3.0 and Event 0.1.4 are vendored
+from spec release 0.5.0 in runtime/spec. Nothing is tagged or published.
+
+### Added
+
+- The documents API (Storage API 0.3.0): `putDocument(ns, doc, chunks)`, `getDocument`, `listDocuments`,
+  `deleteDocument`, `queryChunks(ns, vector, k, opts)` and `redactNamespacePrefix(prefix)`, with
+  `UsageResult.documents`. A document is stored with its chunks (text, page range, a vector each, an optional
+  gate verdict); `queryChunks` returns the nearest chunks with their text and source pages, ordered by score,
+  docId (UTF-8 bytes), then ordinal, and matches a naive reference in the tests. `putDocument` is
+  all-or-nothing, replace and delete are one commit each, and `clear(ns)` physically removes the document
+  namespace (`__ld_doc.<ns>`, the vector index format unchanged: docs/vector-index-format.md section 8).
+  Tests: `test/documents.behaviour.ts` (memory, OPFS, IndexedDB, each across a reopen),
+  `test/documents.test.ts` (a failure injected at every put of a write, events, locks, concurrency),
+  `test/documents-proto.test.ts`, `test/browser/documents.spec.ts` (relaunch, a page closed mid-write, the
+  browser's own listing after `clear`). (D4-02)
+- Events `storage.doc.put`, `storage.doc.delete` and `storage.doc.query` (Event 0.1.4), never carrying a
+  docId, title, sha256, meta, chunk text, vector or score; a namespace under a registered prefix is emitted as
+  `prefix*` (the SDK registers `dockit.d`). `storage.index.open` gains the attr `swept`. (D4-02, D4-03)
+- `npm run bench:documents`: 100 documents x 200 chunks x 384 dims on OPFS and IndexedDB (put, warm and cold
+  query, delete, clear, a browser restart), written to `docs/benchmarks/documents.csv` with generated commit,
+  machine, command and Chrome version, a precise JS heap peak (named as that) and the wording "not measured on
+  8 GB" on every row; `npm run bench:docs-readme` writes the README block from the CSV and nothing else
+  (`test/readme-docs-bench.test.ts` fails on any difference). (D4-05)
+- A `doc` CI job: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`. (BUG-T2-S4-22, D4-04)
+- Test scaffolding: `test/fake-env.ts` (an in-memory OPFS and Web Locks for Node), `test/persist-env.ts`
+  (suites that close and reopen over the same storage), `test/forge.ts` can write forged rows into a document
+  index. (D4-01, D4-02, D4-03)
+- Demo: a Documents section (put three synthetic documents, query, see chunk text and source pages, delete one,
+  reload, clear the namespace and read the browser's own listing). (D4-06)
+
+### Changed
+
+- `sync-contracts` vendors `storage-api.ts` 0.3.0 and `event.ts` 0.1.4 and reads the spec-release 0.5.0
+  `SPEC-LANDED.txt` (paths `spec/<path>`) as well as the older bare listing. (D4-02)
+- The OPFS driver gained the optional hook `getBytesBounded(ns, key, limit)` (the `StorageDriver` contract is
+  unchanged). `LocalData.vectorWasmBytes()` includes the documents kernel. (D4-03, D4-05)
+- CI: every `npm ci` is `npm ci --ignore-scripts` (the lone-copy proof is in `evidence/sprint-5/D4/green/`).
+  README sections follow the Sprint 5 order. (D4-04, D4-05)
+- `package.json` version `0.3.0-alpha.0`. (D4-05)
+
+### Fixed
+
+- S1-100: a KV key named `__proto__` was dropped from the persisted accounting record, so after a reopen
+  `list` and `usage().items` missed it. The record is now built with own-property definition and the key
+  round trips with its TTL, on OPFS, IndexedDB and memory. (D4-01)
+- S1-101: the value codec dropped an own `__proto__` member on encode and let stored bytes set the prototype
+  of the decoded object on decode. Both directions now define an own member; the decoded object always has
+  `Object.prototype`. (D4-01)
+- S1-092: the OPFS driver checks `File.size` against the length a HEAD or part must have before it calls
+  `arrayBuffer()`, so a planted oversize or truncated file is refused as `corrupt` without being read; an
+  unparseable or malformed `keys.json` in a `__ld_vec.` or `__ld_doc.` namespace is `corrupt` with reason
+  `keys_json` instead of an empty index, and `clear(ns)` still recovers such a namespace. (D4-03)
+- T1-S4-08, code part: opening an index sweeps the part records no HEAD references (an interrupted write, the
+  old segments after a dim change) and reports the count as `swept`; the sweep takes the writer lock only if it
+  is free and never waits. The Limitations wording is updated. (D4-03)
+- BUG-T2-S4-22: `cargo doc -D warnings` failed for `ldvec` (unescaped `f32[rows]` and an ambiguous `format`
+  link in doc comments). (D4-04)
+
+### Security
+
+- S1-100, S1-101, S1-092 above; the documents API re-validates every decoded record and never returns a prototype
+  taken from stored bytes. `deleteDocument` hides chunks and does not erase bytes: README Limitations says so,
+  and `clear(ns)` on a per-document namespace is the physical delete. No encryption at rest (README Limitations).
+
 ## [0.2.0-alpha.0] - 2026-11-14 (untagged)
 
 Nothing has ever been tagged or published, so everything since the first commit ships in this one

@@ -1,8 +1,10 @@
 # Vector index
 
-Status: **flat index implemented** in `0.2.0-alpha.0` (Sprint 4). HNSW is not built (Sprint 6, after a
-build-or-adopt note). The on-disk format is in [vector-index-format.md](vector-index-format.md); the
-behaviour is the normative part of Storage API 0.2.0 (`runtime/spec/storage-api.md`, committed; public
+Status: **flat index implemented** in `0.2.0-alpha.0` (Sprint 4) and reused unchanged by the documents API
+of `0.3.0-alpha.0` (Sprint 5; [vector-index-format.md](vector-index-format.md) section 8). HNSW is not built
+(Sprint 6, and the TD-17 build-or-adopt note comes first). The on-disk format is in
+[vector-index-format.md](vector-index-format.md); the behaviour is the normative part of Storage API 0.2.0
+and 0.3.0 (`runtime/spec/storage-api.md`, committed; public
 after the owner's push). The measured figures are in the README Benchmarks block, generated from
 `docs/benchmarks/vector-index.csv`; this page quotes none of them.
 
