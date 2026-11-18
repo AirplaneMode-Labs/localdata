@@ -2,8 +2,10 @@
 // exercises the SDK's set/get/delete/list/usage surface against the OPFS, IndexedDB and memory
 // drivers, lists the storage.* events the SDK emits to an EventSink, shows
 // navigator.storage.estimate() and persist(), builds and queries a flat vector index of synthetic rows
-// (namespace demo-vectors) with a cold-query measurement and a check against the naive reference, and
-// fills quota with synthetic data under the namespace demo-fill.
+// (namespace demo-vectors) with a cold-query measurement and a check against the naive reference, stores
+// three synthetic documents with the documents API (namespace demo-docs: put, query with chunk text and
+// source pages, delete one, reload, clear), and fills quota with synthetic data under the namespace
+// demo-fill.
 // It makes no network request and touches no storage outside localdata's own OPFS directory and
 // IndexedDB database (airplanemode-localdata).
 import {
@@ -11,6 +13,7 @@ import {
   indexedDbAvailable,
   opfsAvailable,
   STORAGE_EVENT_NAMES,
+  STORAGE_ROOT,
   StorageError,
   type Event,
   type EventSink,
@@ -28,9 +31,13 @@ const FILL_CEILING_BYTES = 512 * 1024 * 1024;
 const BINARY_BYTES = 1024 * 1024;
 
 {
+  // 'Built from main at <sha12>' (CI) or 'Local build <sha12>[-dirty]'; anything else renders as a local build.
   const node = document.getElementById('build-sha');
-  const sha = node?.getAttribute('data-sha') ?? '';
-  if (node) node.textContent = /^([0-9a-f]{12}|local)$/.test(sha) ? sha : 'local';
+  const id = node?.getAttribute('data-build') ?? '';
+  const ok = /^(Built from main at [0-9a-f]{12}|Local build ([0-9a-f]{12}(-dirty)?|local))$/.test(
+    id,
+  );
+  if (node) node.textContent = ok ? id : 'Local build local';
 }
 
 function el<T extends HTMLElement>(id: string): T {
@@ -76,6 +83,17 @@ const ui = {
   vecBytes: el<HTMLTableCellElement>('vec-bytes'),
   vecMatch: el<HTMLTableCellElement>('vec-match'),
   vecHits: el<HTMLOListElement>('vec-hits'),
+  docPut: el<HTMLButtonElement>('doc-put'),
+  docTarget: el<HTMLSelectElement>('doc-target'),
+  docQuery: el<HTMLButtonElement>('doc-query'),
+  docDeleteId: el<HTMLSelectElement>('doc-delete-id'),
+  docDelete: el<HTMLButtonElement>('doc-delete'),
+  docList: el<HTMLButtonElement>('doc-list'),
+  docReload: el<HTMLButtonElement>('doc-reload'),
+  docClear: el<HTMLButtonElement>('doc-clear'),
+  docStatus: el<HTMLParagraphElement>('doc-status'),
+  docHits: el<HTMLOListElement>('doc-hits'),
+  docListing: el<HTMLParagraphElement>('doc-listing'),
   fillStart: el<HTMLButtonElement>('fill-start'),
   fillStop: el<HTMLButtonElement>('fill-stop'),
   fillClear: el<HTMLButtonElement>('fill-clear'),
@@ -596,6 +614,271 @@ function wireVectors(): void {
   }
 }
 
+// ----- documents (Storage API 0.3.0) ----------------------------------------------------------
+
+// Its own store (driver 'auto'), closed after every action so Reload page then List documents is a genuine
+// reopen. Three synthetic documents of four chunks: fixed made-up sentences, vectors from bench/synth.ts.
+// No real document, no extraction and no embedding model here (that pipeline is the dockit demo).
+
+const DOC_NS = 'demo-docs';
+
+interface DemoDoc {
+  id: string;
+  title: string;
+  pages: number;
+  chunks: ReadonlyArray<{ page: number; text: string }>;
+}
+
+const DEMO_DOCS: readonly DemoDoc[] = [
+  {
+    id: 'demo-policy',
+    title: 'Demo policy (synthetic)',
+    pages: 2,
+    chunks: [
+      { page: 1, text: 'Synthetic policy clause 1: the cooling-off period is 15 days.' },
+      {
+        page: 1,
+        text: 'Synthetic policy clause 2: the grace period for a late premium is 45 days.',
+      },
+      { page: 2, text: 'Synthetic policy clause 3: a claim must be filed within 90 days.' },
+      { page: 2, text: 'Synthetic policy clause 4: the waiting period is 30 days.' },
+    ],
+  },
+  {
+    id: 'demo-terms',
+    title: 'Demo terms (synthetic)',
+    pages: 3,
+    chunks: [
+      {
+        page: 1,
+        text: 'Synthetic terms clause 1: either party may end the agreement with 60 days notice.',
+      },
+      { page: 2, text: 'Synthetic terms clause 2: fees are due on the first day of each month.' },
+      { page: 2, text: 'Synthetic terms clause 3: a late fee of 2 percent applies after 10 days.' },
+      { page: 3, text: 'Synthetic terms clause 4: disputes go to a single arbitrator.' },
+    ],
+  },
+  {
+    id: 'demo-notes',
+    title: 'Demo notes (synthetic)',
+    pages: 1,
+    chunks: [
+      { page: 1, text: 'Synthetic note 1: the review meeting is on the third Monday.' },
+      { page: 1, text: 'Synthetic note 2: the checklist has seven items.' },
+      { page: 1, text: 'Synthetic note 3: the archive is closed during audits.' },
+      { page: 1, text: 'Synthetic note 4: keep a copy of every signed page.' },
+    ],
+  },
+];
+
+const docVector = (d: number, c: number): Float32Array => synthVector(500_000 + d * 10 + c, DIM);
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+let docBusy = false;
+
+function docSetBusy(busy: boolean): void {
+  docBusy = busy;
+  for (const b of [ui.docPut, ui.docQuery, ui.docDelete, ui.docList, ui.docReload, ui.docClear])
+    b.disabled = busy;
+  ui.docTarget.disabled = busy;
+  ui.docDeleteId.disabled = busy;
+}
+
+async function docOpen(): Promise<LocalData> {
+  return createStore({ driver: 'auto', events: eventSink });
+}
+
+async function docRun(action: (s: LocalData) => Promise<string>): Promise<void> {
+  if (docBusy) return;
+  docSetBusy(true);
+  let s: LocalData | undefined;
+  try {
+    s = await docOpen();
+    ui.docStatus.textContent = `[${stamp()}] ${await action(s)}`;
+  } catch (e) {
+    ui.docStatus.textContent = `[${stamp()}] ${showError(e)}`;
+  } finally {
+    await s?.close();
+    docSetBusy(false);
+    void refreshStoragePanel();
+  }
+}
+
+/** Documents of the page's own namespace: what the browser itself holds, not what the SDK says. */
+async function browserListing(driver: string): Promise<number> {
+  const driverNs = `__ld_doc.${DOC_NS}`;
+  if (driver === 'opfs') {
+    const top = await navigator.storage.getDirectory();
+    let app: FileSystemDirectoryHandle;
+    try {
+      app = await top.getDirectoryHandle(STORAGE_ROOT);
+    } catch {
+      return 0;
+    }
+    const v1 = await app.getDirectoryHandle('v1').catch(() => undefined);
+    if (!v1) return 0;
+    const dir = await v1.getDirectoryHandle(driverNs).catch(() => undefined);
+    if (!dir) return 0;
+    let n = 0;
+    for await (const _name of dir.keys()) n++;
+    return n;
+  }
+  if (driver === 'indexeddb') {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const r = indexedDB.open(STORAGE_ROOT);
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error ?? new Error('IndexedDB open failed'));
+    });
+    try {
+      if (!db.objectStoreNames.contains('kv')) return 0;
+      return await new Promise<number>((resolve, reject) => {
+        const q = db
+          .transaction('kv', 'readonly')
+          .objectStore('kv')
+          .count(IDBKeyRange.bound([driverNs], [driverNs, []]));
+        q.onsuccess = () => resolve(q.result);
+        q.onerror = () => reject(q.error ?? new Error('count failed'));
+      });
+    } finally {
+      db.close();
+    }
+  }
+  return 0;
+}
+
+function renderHits(
+  hits: ReadonlyArray<{
+    docId: string;
+    pageStart: number;
+    pageEnd: number;
+    ordinal: number;
+    score: number;
+    text: string;
+  }>,
+): void {
+  ui.docHits.replaceChildren(
+    ...hits.map((h) => {
+      const li = document.createElement('li');
+      const pages =
+        h.pageStart === h.pageEnd ? `page ${h.pageStart}` : `pages ${h.pageStart}-${h.pageEnd}`;
+      li.textContent = `${h.docId}, ${pages} (chunk ${h.ordinal + 1}), score ${h.score.toFixed(4)}: ${JSON.stringify(h.text)}`;
+      return li;
+    }),
+  );
+}
+
+function fillDocControls(): void {
+  ui.docTarget.replaceChildren(
+    ...DEMO_DOCS.flatMap((d, di) =>
+      d.chunks.map((c, ci) => {
+        const o = document.createElement('option');
+        o.value = `${di}:${ci}`;
+        o.textContent = `${d.id} chunk ${ci + 1}`;
+        void c;
+        return o;
+      }),
+    ),
+  );
+  ui.docTarget.value = '0:1';
+  ui.docDeleteId.replaceChildren(
+    ...DEMO_DOCS.map((d) => {
+      const o = document.createElement('option');
+      o.value = d.id;
+      o.textContent = d.id;
+      return o;
+    }),
+  );
+}
+
+async function docListText(s: LocalData): Promise<string> {
+  const docs = await s.listDocuments(DOC_NS);
+  const u = await s.usage(DOC_NS);
+  const rows = docs.map((d) => `${d.docId} (${d.chunks} chunks, ${d.pages} page(s))`);
+  return `${docs.length} document(s) in ${DOC_NS} on ${s.driver}: ${rows.join(', ') || 'none'}; usage.documents ${u.documents ?? 'omitted'}.`;
+}
+
+function wireDocuments(): void {
+  fillDocControls();
+  ui.docPut.addEventListener(
+    'click',
+    () =>
+      void docRun(async (s) => {
+        const t0 = performance.now();
+        const put: string[] = [];
+        for (const [di, d] of DEMO_DOCS.entries()) {
+          const text = d.chunks.map((c) => c.text).join('\n');
+          const r = await s.putDocument(
+            DOC_NS,
+            {
+              docId: d.id,
+              title: d.title,
+              sha256: await sha256Hex(text),
+              bytes: new TextEncoder().encode(text).byteLength,
+              pages: d.pages,
+              meta: { synthetic: true },
+            },
+            d.chunks.map((c, ci) => ({
+              ordinal: ci,
+              pageStart: c.page,
+              pageEnd: c.page,
+              text: c.text,
+              vector: docVector(di, ci),
+            })),
+          );
+          put.push(`${r.docId}: ${r.chunks} chunks${r.replaced ? ' (replaced)' : ''}`);
+        }
+        return `put ${put.join('; ')} in ${(performance.now() - t0).toFixed(1)} ms on ${s.driver}. ${await docListText(s)}`;
+      }),
+  );
+  ui.docQuery.addEventListener(
+    'click',
+    () =>
+      void docRun(async (s) => {
+        const [di, ci] = ui.docTarget.value.split(':').map(Number) as [number, number];
+        const base = docVector(di, ci);
+        const noise = synthVector(999_999, DIM);
+        const q = new Float32Array(DIM);
+        for (let i = 0; i < DIM; i++) q[i] = base[i]! + 0.25 * noise[i]!;
+        const t0 = performance.now();
+        const hits = await s.queryChunks(DOC_NS, q, 3);
+        const ms = performance.now() - t0;
+        renderHits(hits);
+        return `queryChunks near ${DEMO_DOCS[di]!.id} chunk ${ci + 1}: ${hits.length} hit(s) in ${ms.toFixed(1)} ms (the page of each chunk is stored with it).`;
+      }),
+  );
+  ui.docDelete.addEventListener(
+    'click',
+    () =>
+      void docRun(async (s) => {
+        const id = ui.docDeleteId.value;
+        const removed = await s.deleteDocument(DOC_NS, id);
+        ui.docHits.replaceChildren();
+        return `deleteDocument ${id} -> ${removed}. ${await docListText(s)}`;
+      }),
+  );
+  ui.docList.addEventListener('click', () => void docRun((s) => docListText(s)));
+  ui.docReload.addEventListener('click', () => location.reload());
+  ui.docClear.addEventListener(
+    'click',
+    () =>
+      void docRun(async (s) => {
+        await s.clear(DOC_NS);
+        ui.docHits.replaceChildren();
+        const n = await browserListing(s.driver);
+        ui.docListing.textContent = `The browser's own listing for the namespace __ld_doc.${DOC_NS} on ${s.driver}: ${n} file(s) or record(s).`;
+        return `cleared ${DOC_NS}: ${(await s.listDocuments(DOC_NS)).length} document(s) left.`;
+      }),
+  );
+  if (!opfsAvailable() && !indexedDbAvailable()) {
+    ui.docStatus.textContent = 'Neither OPFS nor IndexedDB is available in this browser.';
+    docSetBusy(true);
+  }
+}
+
 // ----- quota fill ----------------------------------------------------------------------------
 
 let filling = false;
@@ -716,6 +999,7 @@ function wire(): void {
   ui.close.addEventListener('click', () => void closeStore());
   wireKv();
   wireVectors();
+  wireDocuments();
   ui.persist.addEventListener('click', async () => {
     try {
       const granted = await navigator.storage.persist();

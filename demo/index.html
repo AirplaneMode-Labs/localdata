@@ -18,16 +18,10 @@
         Everything runs in this tab. Nothing is uploaded; the only network requests are for this
         page's own files.
       </p>
-      <p class="status-line" id="sprint-status">
-        Sprint 4 (14 Nov 2026). A flat vector index in OPFS or IndexedDB: build 10,000 or 100,000
-        synthetic rows, reload the page, run a cold query and see the measured time and a match
-        against the naive reference; set/get/delete/list and the storage.* events, now including
-        storage.query, storage.index.open and storage.index.write. Measured on an Apple M5 Pro 48
-        GB; not measured on 8 GB.
-      </p>
-      <p class="status-line">
-        Built from main at <code id="build-sha" data-sha="__BUILD_SHA__">local</code> by
-        <code>.github/workflows/pages.yml</code>
+      <!-- prettier-ignore -->
+      <p class="status-line" id="sprint-status">Sprint 5 (18 Nov 2026): Working: a documents API (putDocument, queryChunks returning chunk text and source page, deleteDocument; all-or-nothing, with clear(ns) removing a document namespace physically), prototype-safe keys and values, size-checked OPFS reads, a sweep of unreferenced records on open, all on OPFS, IndexedDB and memory in Chrome on an Apple M5 Pro with 48 GB (not measured on 8 GB). Not yet: HNSW, quantisation, compaction, encryption at rest, an 8 GB measurement.</p>
+      <p class="status-line" id="build-line">
+        <code id="build-sha" data-build="__BUILD_ID__">Local build local</code>
       </p>
     </header>
 
@@ -63,14 +57,23 @@
         <h2>What this demo does not do yet</h2>
         <ul>
           <li>
-            Not yet: HNSW (Sprint 6), quantisation, compaction, multi-tab writers beyond one writer
-            at a time, encryption at rest, storage events in the Airplane Mode DevTools panel
-            (Sprint 5), an 8 GB laptop measurement.
+            Not yet: HNSW (Sprint 6, after the TD-17 note), quantisation, compaction, encryption at
+            rest, and a measurement on an 8 GB laptop (not measured on 8 GB).
           </li>
           <li>
-            The vector index is a flat scan: every query scores every row. The figures on this page
-            are measured in this tab on this device; the README figures are from an Apple M5 Pro 48
-            GB and nothing here is an 8 GB figure.
+            There is no compaction: deleting a document hides its chunks from every query but the
+            bytes stay until the namespace is cleared. Nothing is encrypted at rest: any script on
+            this origin, and anyone with this browser profile, can read what is stored.
+          </li>
+          <li>
+            The vector index and the documents are flat scans: every query scores every row. The
+            figures on this page are measured in this tab on this device; the README figures are
+            from an Apple M5 Pro 48 GB and nothing here is an 8 GB figure.
+          </li>
+          <li>
+            The documents on this page are three synthetic, made-up documents with seeded vectors.
+            There is no PDF reading, no text extraction and no embedding model here: that pipeline
+            is the dockit demo.
           </li>
           <li>
             The <code>storage.*</code> events reach only the list on this page: it registers an
@@ -83,7 +86,7 @@
           <li>
             The key-value side has no cross-tab coordination: two tabs writing the same namespace
             can leave the accounting record stale until the next read repairs it. (The vector index
-            takes a Web Lock per namespace.)
+            and the documents take a Web Lock per namespace.)
           </li>
           <li>
             Chrome under-reports IndexedDB usage in <code>estimate()</code>, so the browser figure
@@ -237,6 +240,31 @@
         <ol id="vec-hits" class="events" aria-live="polite"></ol>
         <!-- prettier-ignore -->
         <p class="muted">Measured in this tab on this device. The README figure is from an Apple M5 Pro 48 GB; not measured on 8 GB.</p>
+      </section>
+
+      <section id="documents" class="box">
+        <h2>Documents</h2>
+        <!-- prettier-ignore -->
+        <p>Three synthetic documents of four chunks each (fixed made-up sentences with seeded vectors of dimension 384; no real document and no model), stored with <code>putDocument</code> in the namespace <code>demo-docs</code> and found again with <code>queryChunks</code>, which returns each chunk's text and the page it came from. The page uses its own store (OPFS, else IndexedDB) and closes it after every action, so Reload page followed by List documents is a genuine reopen.</p>
+        <div class="row">
+          <button id="doc-put" type="button">Put 3 documents</button>
+          <label for="doc-target">Query near</label>
+          <select id="doc-target"></select>
+          <button id="doc-query" type="button">Query</button>
+        </div>
+        <div class="row">
+          <label for="doc-delete-id">Delete document</label>
+          <select id="doc-delete-id"></select>
+          <button id="doc-delete" type="button">Delete</button>
+          <button id="doc-list" type="button">List documents</button>
+          <button id="doc-reload" type="button">Reload page</button>
+          <button id="doc-clear" type="button">Clear namespace</button>
+        </div>
+        <p id="doc-status" class="mono" aria-live="polite"></p>
+        <ol id="doc-hits" class="events" aria-live="polite"></ol>
+        <p id="doc-listing" class="muted" aria-live="polite"></p>
+        <!-- prettier-ignore -->
+        <p class="muted">Delete hides a document's chunks in one commit; Clear namespace removes every file or record of the namespace, and the line above shows the browser's own count afterwards. Measured in this tab; not measured on 8 GB.</p>
       </section>
 
       <section id="fill" class="box">
