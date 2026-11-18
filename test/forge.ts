@@ -1,7 +1,11 @@
 // Test-only helpers for forging a vector index on a driver: a bitwise CRC-32C (independent of the
 // kernel), HEAD field editing that recomputes both checksums so a structural lie survives the CRC
 // gate, and META editing that recomputes the segment's metaCrc and then the HEAD.
-import type { StorageDriver } from '../src/contracts/storage-api';
+import type { StorageDriver, VectorRow } from '../src/contracts/storage-api';
+import { DOC_NS_PREFIX } from '../src/drivers/types';
+import { StorageEvents } from '../src/events';
+import { VectorStore } from '../src/vec';
+import { DEFAULT_MAX_INDEX_BYTES } from '../src/vec/files';
 
 export function crc32c(bytes: Uint8Array, prev = 0): number {
   let crc = ~prev >>> 0;
@@ -107,4 +111,30 @@ export async function editVec(
   await editHead(d, ns, (_h, dv) => {
     dv.setUint32(64 + 32 * entry + SEG_FIELD.vecCrc, crc32c(vec), true);
   });
+}
+
+/**
+ * Writes `rows` straight into the document index of `ns` ('__ld_doc.' + ns) through the SDK's own writer,
+ * bypassing the documents API: the way to put stored bytes there that the API would never write (a
+ * forged record, a '__proto__' member, wrong types). The driver is opened here and left open.
+ */
+export async function forgeDocRows(
+  driver: StorageDriver,
+  ns: string,
+  rows: VectorRow[],
+): Promise<void> {
+  const store = new VectorStore({
+    driver,
+    events: new StorageEvents(undefined, driver.name, undefined),
+    kernel: 'auto',
+    maxIndexBytes: DEFAULT_MAX_INDEX_BYTES,
+    checkSoft: () => undefined,
+    prefix: DOC_NS_PREFIX,
+  });
+  try {
+    await driver.open();
+    await store.putVectors(ns, rows);
+  } finally {
+    store.close();
+  }
 }

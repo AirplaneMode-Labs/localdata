@@ -154,11 +154,12 @@ describe('vector error hygiene', () => {
 });
 
 describe('storage.query, storage.index.open and storage.index.write events', () => {
-  it('STORAGE_EVENT_NAMES lists seven names including the three new ones', () => {
+  it('STORAGE_EVENT_NAMES lists ten names (Event 0.1.4) including the vector ones and storage.doc.*', () => {
     expect(STORAGE_EVENT_NAMES).toContain('storage.query');
     expect(STORAGE_EVENT_NAMES).toContain('storage.index.open');
     expect(STORAGE_EVENT_NAMES).toContain('storage.index.write');
-    expect(STORAGE_EVENT_NAMES.length).toBe(7);
+    expect(STORAGE_EVENT_NAMES).toContain('storage.doc.put');
+    expect(STORAGE_EVENT_NAMES.length).toBe(10);
   });
 
   it('a write, a cold query and a hot query emit the documented events with valid shapes', async () => {

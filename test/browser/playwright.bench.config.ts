@@ -1,4 +1,5 @@
-// Playwright config for `npm run bench:vectors` (bench/vector-bench.spec.ts): installed Chrome, one
+// Playwright config for `npm run bench:vectors` (bench/vector-bench.spec.ts) and `npm run bench:documents`
+// (bench/documents-bench.spec.ts): installed Chrome, one
 // worker, a long timeout. The bench spec launches its own persistent contexts (with
 // --enable-precise-memory-info) on a profile directory it is given; this config only supplies the
 // harness server and the test location.
@@ -11,7 +12,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export default defineConfig({
   testDir: resolve(repoRoot, 'bench'),
-  testMatch: /vector-bench\.spec\.ts$/,
+  testMatch: /(vector|documents)-bench\.spec\.ts$/,
   fullyParallel: false,
   workers: 1,
   retries: 0,

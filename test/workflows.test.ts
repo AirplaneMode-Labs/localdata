@@ -118,6 +118,33 @@ describe('workflows', () => {
     ).toMatch(/^npm run build:wasm &&/);
   });
 
+  it('every npm ci runs with --ignore-scripts unless a YAML comment above it says why not (Sprint 5)', () => {
+    let n = 0;
+    for (const [f, src] of text) {
+      const lines = src.split('\n');
+      lines.forEach((line, i) => {
+        if (!/run:\s*npm ci\b/.test(line)) return;
+        n++;
+        const ok = line.includes('--ignore-scripts') || /^\s*#/.test(lines[i - 1] ?? '');
+        expect(ok, `${f}:${i + 1}: ${line.trim()}`).toBe(true);
+      });
+    }
+    expect(n).toBeGreaterThanOrEqual(3);
+  });
+
+  it('a doc job on ubuntu-latest runs cargo doc with -D warnings, --no-deps and --locked (BUG-T2-S4-22)', () => {
+    const doc = jobs(text.get('ci.yml')!).find(([n]) => n === 'doc');
+    expect(doc, 'ci.yml has a doc job').toBeDefined();
+    const body = doc![1];
+    expect(body).toContain('runs-on: ubuntu-latest');
+    expect(body).toContain('contents: read');
+    expect(body).toContain('rust-toolchain');
+    expect(body).toContain(
+      'run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked',
+    );
+    expect(/write/.test(body)).toBe(false);
+  });
+
   it('the Pages build job builds the wasm before the demo, and the deploy job has no toolchain', () => {
     const pages = jobs(text.get('pages.yml')!);
     const build = pages.find(([n]) => n === 'build')![1];

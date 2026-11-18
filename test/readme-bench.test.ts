@@ -79,15 +79,16 @@ describe('README benchmarks', () => {
     expect(readme).toContain('Apple M5 Pro, 48 GB');
     expect(readme).toContain('not measured on 8 GB');
     const base = String(rows[0]!['commit']).replace(/-dirty$/, '');
+    // the vector rows were measured in Sprint 4 and are not re-measured: the wording says so
     expect(readme).toContain(`on the uncommitted Sprint 4 working tree based on ${base}`);
   });
 
-  it('every 8 GB cell reads exactly "not measured" and every table row has one', () => {
+  it('every 8 GB cell reads exactly "not measured on 8 GB" and every table row has one', () => {
     const lines = block()
       .split('\n')
       .filter((l) => l.startsWith('| ') && !l.startsWith('| ---') && !l.startsWith('| Index'));
     expect(lines.length).toBeGreaterThanOrEqual(rows.length > 0 ? 3 : 0);
-    const withCell = lines.filter((l) => l.trimEnd().endsWith('| not measured |'));
+    const withCell = lines.filter((l) => l.trimEnd().endsWith('| not measured on 8 GB |'));
     // the cold table and the memory table carry the column; the "where the time goes" table does not
     expect(withCell.length).toBe(summarise(rows).length * 2);
   });
@@ -108,23 +109,29 @@ describe('README benchmarks', () => {
     expect(b).toContain('Apple M5 Pro, 48 GB; not measured on 8 GB');
   });
 
-  it('keeps the nine README sections in the mandated order and no others', () => {
+  it('keeps the ten README sections of the Sprint 5 conventions, in order, and no others', () => {
     const h2 = [...readme.matchAll(/^## (.+)$/gm)].map((m) => m[1]);
     expect(h2).toEqual([
       'Status',
+      'What it does',
       'Install',
-      'Quick start',
-      'How it works',
-      'Contracts',
+      'Usage',
       'Demo',
       'Benchmarks',
       'Limitations',
+      'Security',
       'Licence',
+      'Contributing',
     ]);
   });
 
+  it('opens its Status with the Sprint 5 status line (Working: ... Not yet: ...)', () => {
+    const status = readme.slice(readme.indexOf('\n## Status'), readme.indexOf('\n## What it does'));
+    expect(status).toMatch(/\nSprint 5 \(18 Nov 2026\): Working: .+\. Not yet: .+\.\n/);
+  });
+
   it('Limitations states every item the plan requires', () => {
-    const lim = readme.slice(readme.indexOf('\n## Limitations'), readme.indexOf('\n## Licence'));
+    const lim = readme.slice(readme.indexOf('\n## Limitations'), readme.indexOf('\n## Security'));
     const need = [
       'single writer per namespace',
       'stale',
@@ -138,6 +145,12 @@ describe('README benchmarks', () => {
       'clear(ns)',
       'not an 8 GB figure',
       'IndexedDB',
+      // Sprint 5 (D4-05)
+      'no HNSW',
+      'TD-17',
+      'no encryption at rest',
+      'deleteDocument hides',
+      'only clear(ns) removes',
     ];
     for (const n of need) expect(lim.toLowerCase(), n).toContain(n.toLowerCase());
   });

@@ -81,7 +81,7 @@ async function make(
 }
 
 describe('storage.* events: shapes', () => {
-  it('exports STORAGE_EVENT_NAMES with the seven names of Event 0.1.3', () => {
+  it('exports STORAGE_EVENT_NAMES with the ten names of Event 0.1.4 (seven of 0.1.3 plus storage.doc.*)', () => {
     expect([...STORAGE_EVENT_NAMES]).toEqual([
       'storage.set',
       'storage.get',
@@ -90,6 +90,9 @@ describe('storage.* events: shapes', () => {
       'storage.query',
       'storage.index.open',
       'storage.index.write',
+      'storage.doc.put',
+      'storage.doc.delete',
+      'storage.doc.query',
     ]);
   });
 

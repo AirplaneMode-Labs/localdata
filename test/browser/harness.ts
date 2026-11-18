@@ -13,10 +13,27 @@ import {
   type StorageDriver,
 } from '../../src/index';
 import { f32Bits, topKRef, type RefRow } from '../../src/vec/reference';
-import { DIM, synthKey, synthQuery, synthRow, synthRows, synthVector } from '../../bench/synth';
+import {
+  DIM,
+  synthKey,
+  synthQuery,
+  synthRow,
+  synthRows,
+  synthValue,
+  synthVector,
+} from '../../bench/synth';
 import { collectSuite, type MakeStoreOptions, type SuiteResult } from '../storage.behaviour';
 import { queryCases } from '../query.behaviour';
 import { collectVectorSuite, type VectorEnv, type VectorSuiteResult } from '../vector.behaviour';
+import { protoCases } from '../proto.behaviour';
+import {
+  documentCases,
+  makeChunks,
+  docInput,
+  refQueryChunks,
+  type RefChunk,
+} from '../documents.behaviour';
+import { collectPersistCases, type PersistEnv, type PersistResult } from '../persist-env';
 
 type DriverName = 'opfs' | 'indexeddb';
 
@@ -269,6 +286,30 @@ function vectorEnvFor(driver: DriverName): VectorEnv {
 async function runVectorSuite(driver: DriverName): Promise<VectorSuiteResult[]> {
   log(`vector suite: ${driver}`);
   const results = await collectVectorSuite(vectorEnvFor(driver));
+  for (const r of results)
+    log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.error ? ` -- ${r.error}` : ''}`);
+  return results;
+}
+
+function persistEnvFor(driver: DriverName): PersistEnv {
+  return {
+    makeStore: async (opts) => {
+      await reset(driver);
+      return createStore({ driver, ...(opts ?? {}) });
+    },
+    reopen: async (opts) => createStore({ driver, ...(opts ?? {}) }),
+    raw: async (): Promise<StorageDriver> => {
+      const d = driver === 'opfs' ? new OpfsDriver() : new IndexedDbDriver();
+      await d.open();
+      return d;
+    },
+  };
+}
+
+/** S1-100 and S1-101 (prototype-safe keys and values) against a real driver, each across a reopen. */
+async function runProtoCases(driver: DriverName): Promise<PersistResult[]> {
+  log(`proto cases: ${driver}`);
+  const results = await collectPersistCases(protoCases, persistEnvFor(driver));
   for (const r of results)
     log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.error ? ` -- ${r.error}` : ''}`);
   return results;
@@ -646,6 +687,507 @@ async function benchCold(driver: DriverName, rows: number, chunkBytes: number) {
   };
 }
 
+// ---- S1-092 and the open-time sweep (T1-S4-08) in real Chrome ----------------------------------------
+
+const HARDEN_NS = 'hardening';
+const HARDEN_VNS = `__ld_vec.${HARDEN_NS}`;
+
+function newDriver(driver: DriverName): StorageDriver {
+  return driver === 'opfs' ? new OpfsDriver() : new IndexedDbDriver();
+}
+
+async function hardenBuild(driver: DriverName, rows = 200): Promise<void> {
+  await reset(driver);
+  const store = await createStore({ driver });
+  await store.putVectors(HARDEN_NS, synthRows(0, rows, { chunkBytes: 40 }));
+  await store.close();
+}
+
+async function plantRecord(driver: DriverName, name: string, bytes: Uint8Array): Promise<void> {
+  const d = newDriver(driver);
+  await d.open();
+  await d.put(HARDEN_VNS, name, bytes, { size: bytes.byteLength });
+  await d.close();
+}
+
+async function recordLength(driver: DriverName, name: string): Promise<number> {
+  const d = newDriver(driver);
+  await d.open();
+  const rec = await d.getBytes(HARDEN_VNS, name);
+  await d.close();
+  return rec?.bytes.byteLength ?? -1;
+}
+
+async function queryOutcome(driver: DriverName, opts: Record<string, unknown> = {}) {
+  const store = await createStore({ driver, ...opts });
+  try {
+    const hits = await store.query(HARDEN_NS, synthQuery(0), 5);
+    return { hits: hits.length, code: null as string | null, reason: null as string | null };
+  } catch (e) {
+    const err = e as { code?: string; details?: Record<string, unknown> };
+    return {
+      hits: -1,
+      code: err.code ?? null,
+      reason: (err.details?.['reason'] as string | undefined) ?? null,
+      file: (err.details?.['file'] as string | undefined) ?? null,
+    };
+  } finally {
+    await store.close();
+  }
+}
+
+/**
+ * S1-092 on a real file system: an index is built, one record is replaced by `plant` bytes, and the next
+ * query runs with Blob.prototype.arrayBuffer instrumented. Reports what was refused and which blob sizes
+ * were ever read into memory.
+ */
+async function hardenOversize(driver: DriverName, record: string, extraBytes: number) {
+  await hardenBuild(driver);
+  const good = await recordLength(driver, record);
+  const planted = good + extraBytes;
+  await plantRecord(driver, record, new Uint8Array(planted));
+  const sizes: number[] = [];
+  const orig = Blob.prototype.arrayBuffer;
+  Blob.prototype.arrayBuffer = function (this: Blob) {
+    sizes.push(this.size);
+    return orig.call(this);
+  };
+  try {
+    const out = await queryOutcome(driver);
+    return { ...out, good, planted, readPlanted: sizes.includes(planted), reads: sizes.length };
+  } finally {
+    Blob.prototype.arrayBuffer = orig;
+    await reset(driver);
+  }
+}
+
+/** A real OPFS keys.json of the vector namespace overwritten with `text`, then a query and a clear. */
+async function hardenKeysJson(text: string) {
+  await hardenBuild('opfs');
+  const top = await navigator.storage.getDirectory();
+  const app = await top.getDirectoryHandle(STORAGE_ROOT);
+  const v1 = await app.getDirectoryHandle('v1');
+  const dir = await v1.getDirectoryHandle(HARDEN_VNS);
+  const fh = await dir.getFileHandle('keys.json');
+  const w = await fh.createWritable({ keepExistingData: false });
+  await w.write(text);
+  await w.close();
+  const refused = await queryOutcome('opfs');
+  const store = await createStore({ driver: 'opfs' });
+  await store.clear(HARDEN_NS);
+  const afterClear = await store.query(HARDEN_NS, synthQuery(0), 5);
+  await store.putVectors(HARDEN_NS, synthRows(0, 5, { chunkBytes: 8 }));
+  const rebuilt = (await store.query(HARDEN_NS, synthQuery(0), 5)).length;
+  await store.close();
+  await reset('opfs');
+  return { refused, afterClear: afterClear.length, rebuilt };
+}
+
+const ORPHAN_NAMES = ['vec-9/00000', 'meta-9/00000', 'val-9/00001', 'vec-0/00007'];
+
+/** Orphan records planted next to a committed index are swept on open and counted in the event. */
+async function sweepProbe(driver: DriverName) {
+  await hardenBuild(driver);
+  const d = newDriver(driver);
+  await d.open();
+  const before = await d.keys(HARDEN_VNS);
+  for (const n of ORPHAN_NAMES) await d.put(HARDEN_VNS, n, new Uint8Array(8), { size: 8 });
+  const planted = await d.keys(HARDEN_VNS);
+  await d.close();
+  const events: Event[] = [];
+  const store = await createStore({ driver, events: { emit: (e) => void events.push(e) } });
+  const hits = viewOf(await store.query(HARDEN_NS, synthQuery(0), 10));
+  await store.close();
+  const check = newDriver(driver);
+  await check.open();
+  const after = await check.keys(HARDEN_VNS);
+  await check.close();
+  const want = viewOf(topKRef(refRowsOf([[0, 200]]), synthQuery(0), 10, 'cosine'));
+  const opens = events.filter((e) => e.name === 'storage.index.open');
+  return {
+    before,
+    planted,
+    after,
+    swept: opens.map((e) => e.attrs['swept']),
+    match: JSON.stringify(hits) === JSON.stringify(want),
+  };
+}
+
+/** Holds the writer lock of the hardening namespace until releaseLock() (another tab's writer). */
+let releaseHeld: (() => void) | undefined;
+async function holdWriterLock(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    void navigator.locks.request(
+      `airplanemode-localdata:vec:${HARDEN_NS}`,
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((release) => {
+          releaseHeld = release;
+          resolve(true);
+        }),
+    );
+  });
+}
+function releaseWriterLock(): void {
+  releaseHeld?.();
+  releaseHeld = undefined;
+}
+
+/** Plants orphans (no reset), opens with events and reports swept and whether the read waited. */
+async function sweepWhileLocked(driver: DriverName) {
+  const d = newDriver(driver);
+  await d.open();
+  for (const n of ORPHAN_NAMES) await d.put(HARDEN_VNS, n, new Uint8Array(8), { size: 8 });
+  await d.close();
+  const events: Event[] = [];
+  const t0 = performance.now();
+  const store = await createStore({ driver, events: { emit: (e) => void events.push(e) } });
+  const hits = (await store.query(HARDEN_NS, synthQuery(0), 5)).length;
+  const ms = performance.now() - t0;
+  await store.close();
+  const check = newDriver(driver);
+  await check.open();
+  const remaining = (await check.keys(HARDEN_VNS)).filter((n) => ORPHAN_NAMES.includes(n));
+  await check.close();
+  return {
+    hits,
+    ms,
+    remaining,
+    swept: events.filter((e) => e.name === 'storage.index.open').map((e) => e.attrs['swept']),
+  };
+}
+
+// ---- documents API (Storage API 0.3.0) in real Chrome -------------------------------------------------
+
+/** The shared documents cases against a real driver, each across a reopen. */
+async function runDocumentCases(driver: DriverName): Promise<PersistResult[]> {
+  log(`document cases: ${driver}`);
+  const results = await collectPersistCases(documentCases, persistEnvFor(driver));
+  for (const r of results)
+    log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.error ? ` -- ${r.error}` : ''}`);
+  return results;
+}
+
+/** What the browser itself says is stored for a namespace, without going through the SDK. */
+async function rawNamespaceListing(driver: DriverName, driverNs: string) {
+  if (driver === 'opfs') {
+    const top = await navigator.storage.getDirectory();
+    const names: string[] = [];
+    let app: FileSystemDirectoryHandle | undefined;
+    try {
+      app = await top.getDirectoryHandle(STORAGE_ROOT);
+    } catch {
+      return { namespaces: [] as string[], files: [] as string[], records: 0 };
+    }
+    const v1 = await app.getDirectoryHandle('v1');
+    for await (const n of v1.keys()) names.push(n);
+    const files: string[] = [];
+    if (names.includes(driverNs)) {
+      const dir = await v1.getDirectoryHandle(driverNs);
+      for await (const n of dir.keys()) files.push(n);
+    }
+    return { namespaces: names, files, records: files.length };
+  }
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const r = indexedDB.open(STORAGE_ROOT);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error ?? new Error('open failed'));
+  });
+  try {
+    const tx = db.transaction('kv', 'readonly');
+    const store = tx.objectStore('kv');
+    const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+      const q = store.getAllKeys(IDBKeyRange.bound([driverNs], [driverNs, []]));
+      q.onsuccess = () => resolve(q.result);
+      q.onerror = () => reject(q.error ?? new Error('getAllKeys failed'));
+    });
+    const all = await new Promise<IDBValidKey[]>((resolve, reject) => {
+      const q = store.index('ns').getAllKeys();
+      q.onsuccess = () => resolve(q.result);
+      q.onerror = () => reject(q.error ?? new Error('index failed'));
+    });
+    const namespaces = [...new Set(all.map((k) => String(k)))];
+    return { namespaces, files: [] as string[], records: keys.length };
+  } finally {
+    db.close();
+  }
+}
+
+const DOC_PERSIST_NS = 'docpersist';
+
+async function docPersistWrite(driver: DriverName): Promise<void> {
+  await reset(driver);
+  const store = await createStore({ driver, clock: () => 1_700_000_000_000 });
+  await store.putDocument(DOC_PERSIST_NS, docInput('survivor', 6), makeChunks(1, 24, 384));
+  await store.putDocument(DOC_PERSIST_NS, docInput('other', 3), makeChunks(2, 8, 384));
+  await store.deleteDocument(DOC_PERSIST_NS, 'other');
+  await store.close();
+}
+
+async function docPersistCheck(driver: DriverName) {
+  const store = await createStore({ driver });
+  try {
+    const list = await store.listDocuments(DOC_PERSIST_NS);
+    const hits = await store.queryChunks(DOC_PERSIST_NS, synthVector(1000 + 7, 384), 3);
+    return {
+      docs: list.map((d) => d.docId),
+      chunks: list.map((d) => d.chunks),
+      createdAt: list.map((d) => d.createdAt),
+      top: hits.map((h) => ({ docId: h.docId, ordinal: h.ordinal, page: h.pageStart })),
+      text: hits[0]?.text.slice(0, 20) ?? null,
+    };
+  } finally {
+    await store.close();
+  }
+}
+
+/** Starts a putDocument that is slow to read its chunks, so the spec can close the page mid-write. */
+function docStartWrite(driver: DriverName, count: number): void {
+  const w = window as unknown as { __chunks?: number };
+  w.__chunks = 0;
+  async function* chunks() {
+    const all = makeChunks(3, count, 384, 200);
+    for (let i = 0; i < all.length; i++) {
+      w.__chunks = i;
+      if (i % 50 === 0) await new Promise((r) => setTimeout(r, 5));
+      yield all[i]!;
+    }
+    w.__chunks = all.length;
+  }
+  void (async () => {
+    const store: LocalData = await createStore({ driver });
+    await store.putDocument(DOC_PERSIST_NS, docInput('halfway', 600), chunks());
+    await store.close();
+  })().catch(() => undefined);
+}
+
+async function docVisible(driver: DriverName) {
+  const store = await createStore({ driver });
+  try {
+    const info = await store.getDocument(DOC_PERSIST_NS, 'halfway');
+    const hits = await store.queryChunks(DOC_PERSIST_NS, synthVector(3000, 384), 1000);
+    return {
+      doc: info !== undefined,
+      hits: hits.length,
+      docs: (await store.listDocuments(DOC_PERSIST_NS)).length,
+    };
+  } finally {
+    await store.close();
+  }
+}
+
+// ---- documents benchmark (bench/documents-bench.spec.ts) -----------------------------------------------
+
+const DOCB_NS = 'docbench';
+/** 100 documents of 200 chunks each, 384 dims, 400-byte chunk texts: 20,000 chunks. */
+const DOCB = { docs: 100, chunks: 200, dim: DIM, text: 400 };
+
+function docbSeed(doc: number, chunk: number): number {
+  return doc * 1000 + chunk;
+}
+
+function* docbChunks(doc: number) {
+  for (let j = 0; j < DOCB.chunks; j++) {
+    const seed = docbSeed(doc, j);
+    const page = 1 + Math.floor(j / 4);
+    yield {
+      ordinal: j,
+      pageStart: page,
+      pageEnd: page,
+      text: synthValue(seed, DOCB.text),
+      vector: synthVector(seed, DOCB.dim),
+    };
+  }
+}
+
+const docbId = (doc: number): string => `bench-${String(doc).padStart(3, '0')}`;
+
+function docbReference(live: number[], q: Float32Array, k: number) {
+  const corpus: RefChunk[] = [];
+  for (const d of live)
+    for (let j = 0; j < DOCB.chunks; j++)
+      corpus.push({ docId: docbId(d), ordinal: j, vector: synthVector(docbSeed(d, j), DOCB.dim) });
+  return refQueryChunks(corpus, q, k, 'cosine').map((h) => `${h.docId}#${h.ordinal}`);
+}
+
+/** A sampler of the main thread JS heap every 10 ms (precise when Chrome has --enable-precise-memory-info). */
+function heapSampler() {
+  const read = () => (performance as unknown as HeapMemory).memory?.usedJSHeapSize ?? 0;
+  const state = { peak: read() };
+  const timer = setInterval(() => {
+    const m = read();
+    if (m > state.peak) state.peak = m;
+  }, 10);
+  return {
+    stop: () => {
+      clearInterval(timer);
+      const m = read();
+      if (m > state.peak) state.peak = m;
+      return state.peak;
+    },
+  };
+}
+
+const pct = (xs: number[], p: number): number => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0;
+};
+
+let docbStore: LocalData | undefined;
+
+/** Builds the corpus with 100 sequential putDocument calls, then 50 warm queries. Leaves nothing open. */
+async function docBenchBuild(driver: DriverName) {
+  await reset(driver);
+  const store = await createStore({ driver });
+  const heap = heapSampler();
+  const lat: number[] = [];
+  const t0 = performance.now();
+  for (let i = 0; i < DOCB.docs; i++) {
+    const a = performance.now();
+    await store.putDocument(
+      DOCB_NS,
+      {
+        docId: docbId(i),
+        title: `Benchmark document ${i}`,
+        sha256: ('0123456789abcdef'.repeat(4) as string).slice(0, 64),
+        bytes: 1_000_000 + i,
+        pages: 50,
+      },
+      docbChunks(i),
+    );
+    lat.push(performance.now() - a);
+  }
+  const putMs = performance.now() - t0;
+  const putHeap = heap.stop();
+  const usage = await store.usage(DOCB_NS);
+  // warm: the first query loads the vectors; the 50 after it run against the resident index
+  const warmHeap = heapSampler();
+  await store.queryChunks(DOCB_NS, synthQuery(0), 5);
+  const warm: number[] = [];
+  const warmT0 = performance.now();
+  for (let j = 1; j <= 50; j++) {
+    const a = performance.now();
+    await store.queryChunks(DOCB_NS, synthQuery(j), 5);
+    warm.push(performance.now() - a);
+  }
+  const warmTotal = performance.now() - warmT0;
+  const warmPeak = warmHeap.stop();
+  const wasm = store.vectorWasmBytes();
+  const est = await navigator.storage.estimate();
+  const hits = (await store.queryChunks(DOCB_NS, synthQuery(0), 5)).map(
+    (h) => `${h.docId}#${h.ordinal}`,
+  );
+  const match =
+    JSON.stringify(hits) ===
+    JSON.stringify(
+      docbReference(
+        Array.from({ length: DOCB.docs }, (_, i) => i),
+        synthQuery(0),
+        5,
+      ),
+    );
+  const kernel = store.documentsKernel();
+  await store.close();
+  return {
+    put: {
+      totalMs: putMs,
+      p50: pct(lat, 0.5),
+      p95: pct(lat, 0.95),
+      heapPeak: putHeap,
+      indexBytes: usage.bytes,
+      documents: usage.documents ?? 0,
+    },
+    warm: {
+      totalMs: warmTotal,
+      p50: pct(warm, 0.5),
+      p95: pct(warm, 0.95),
+      heapPeak: warmPeak,
+      wasm,
+    },
+    storageUsage: est.usage ?? 0,
+    match,
+    kernel,
+  };
+}
+
+/** One cold measurement for a fresh page: createStore + the first queryChunks (loads and checks the vectors). */
+async function docBenchCold(driver: DriverName) {
+  const heap = heapSampler();
+  const t0 = performance.now();
+  const store = await createStore({ driver });
+  const hits = await store.queryChunks(DOCB_NS, synthQuery(0), 5);
+  const coldMs = performance.now() - t0;
+  docbStore = store;
+  const peak = heap.stop();
+  const usage = await store.usage(DOCB_NS);
+  const est = await navigator.storage.estimate();
+  const got = hits.map((h) => `${h.docId}#${h.ordinal}`);
+  const want = docbReference(
+    Array.from({ length: DOCB.docs }, (_, i) => i),
+    synthQuery(0),
+    5,
+  );
+  return {
+    coldMs,
+    heapPeak: peak,
+    wasm: store.vectorWasmBytes(),
+    indexBytes: usage.bytes,
+    storageUsage: est.usage ?? 0,
+    documents: usage.documents ?? 0,
+    match: JSON.stringify(got) === JSON.stringify(want),
+  };
+}
+
+/** Deletes the first `count` documents one by one on the store docBenchCold left open. */
+async function docBenchDelete(count: number) {
+  const store = docbStore!;
+  const heap = heapSampler();
+  const lat: number[] = [];
+  const t0 = performance.now();
+  for (let i = 0; i < count; i++) {
+    const a = performance.now();
+    if (!(await store.deleteDocument(DOCB_NS, docbId(i)))) throw new Error('document was missing');
+    lat.push(performance.now() - a);
+  }
+  const totalMs = performance.now() - t0;
+  const peak = heap.stop();
+  const live = Array.from({ length: DOCB.docs - count }, (_, i) => i + count);
+  const got = (await store.queryChunks(DOCB_NS, synthQuery(0), 5)).map(
+    (h) => `${h.docId}#${h.ordinal}`,
+  );
+  const usage = await store.usage(DOCB_NS);
+  return {
+    totalMs,
+    p50: pct(lat, 0.5),
+    p95: pct(lat, 0.95),
+    heapPeak: peak,
+    match: JSON.stringify(got) === JSON.stringify(docbReference(live, synthQuery(0), 5)),
+    indexBytes: usage.bytes,
+    documents: usage.documents ?? 0,
+  };
+}
+
+/** clear(ns) on the open store, then the browser's own listing and a query: nothing may be left. */
+async function docBenchClear(driver: DriverName) {
+  const store = docbStore!;
+  const heap = heapSampler();
+  const t0 = performance.now();
+  await store.clear(DOCB_NS);
+  const ms = performance.now() - t0;
+  const peak = heap.stop();
+  const listing = await rawNamespaceListing(driver, `__ld_doc.${DOCB_NS}`);
+  const hits = await store.queryChunks(DOCB_NS, synthQuery(0), 5);
+  await store.close();
+  docbStore = undefined;
+  return {
+    ms,
+    heapPeak: peak,
+    records: listing.records,
+    namespaces: listing.namespaces.filter((n) => n === `__ld_doc.${DOCB_NS}`).length,
+    hits: hits.length,
+  };
+}
+
 const api = {
   ready: true,
   benchBuild,
@@ -654,6 +1196,30 @@ const api = {
   runSuite,
   runVectorSuite,
   runQueryCases,
+  runProtoCases,
+  openForTest: (driver: DriverName) => createStore({ driver }),
+  hardenBuild,
+  hardenOversize,
+  hardenKeysJson,
+  sweepProbe,
+  holdWriterLock,
+  releaseWriterLock,
+  sweepWhileLocked,
+  runDocumentCases,
+  docBenchBuild,
+  docBenchCold,
+  docBenchDelete,
+  docBenchClear,
+  docBenchShape: DOCB,
+  makeChunksForSpec: {
+    doc: (id: string) => docInput(id, 12),
+    chunks: (seed: number, n: number) => makeChunks(seed, n, 16, 300),
+  },
+  rawNamespaceListing,
+  docPersistWrite,
+  docPersistCheck,
+  docStartWrite,
+  docVisible,
   vecPersistWrite,
   vecPersistCheck,
   vecFreshProfileCheck,
