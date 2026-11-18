@@ -53,18 +53,18 @@ function fixture(): { specDir: string; outDir: string; landed: Map<string, strin
 }
 
 describe('vendored contracts', () => {
-  it('vendor storage-api.ts @ 0.2.0 and event.ts @ 0.1.3, each with its own version header', () => {
-    expect(CONTRACT_VERSIONS).toEqual({ 'storage-api.ts': '0.2.0', 'event.ts': '0.1.3' });
+  it('vendor storage-api.ts @ 0.3.0 and event.ts @ 0.1.4, each with its own version header', () => {
+    expect(CONTRACT_VERSIONS).toEqual({ 'storage-api.ts': '0.3.0', 'event.ts': '0.1.4' });
     expect(CONTRACTS.map((c: { target: string }) => c.target.split(/[\\/]/).pop())).toEqual([
       'storage-api.ts',
       'event.ts',
     ]);
     const headers = (CONTRACTS as Array<{ header: string }>).map((c) => c.header);
     expect(headers[0]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.2.0; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.3.0; source of truth is runtime/spec; do not edit here\n',
     );
     expect(headers[1]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.3; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.4; source of truth is runtime/spec; do not edit here\n',
     );
   });
 
@@ -100,6 +100,22 @@ describe('parseLanded', () => {
     expect(map.get('vectors/neg-bad-spec.json')).toBe(b);
     expect(map.size).toBe(2);
   });
+
+  it('reads the spec-release 0.5.0 listing, whose paths carry the spec/ prefix, and the older bare listing alike', () => {
+    const a = 'a'.repeat(64);
+    const b = 'b'.repeat(64);
+    const c = 'c'.repeat(64);
+    const prefixed = parseLanded(
+      `${a}  spec/storage-api.ts\n${b}  spec/README.md\n${c}  spec/vectors/README.md\n`,
+    );
+    expect(prefixed.get('storage-api.ts')).toBe(a);
+    expect(prefixed.get('README.md')).toBe(b);
+    expect(prefixed.get('vectors/README.md')).toBe(c);
+    expect(prefixed.size).toBe(3);
+    const bare = parseLanded(`${a}  storage-api.ts\n${c}  vectors/README.md\n`);
+    expect(bare.get('storage-api.ts')).toBe(a);
+    expect(bare.get('vectors/README.md')).toBe(c);
+  });
 });
 
 describe('sync() gated on SPEC-LANDED.txt', () => {
@@ -108,11 +124,11 @@ describe('sync() gated on SPEC-LANDED.txt', () => {
     const first = sync({ specDir, outDir, landed });
     expect(first.map((r: { status: string }) => r.status)).toEqual(['updated', 'updated']);
     expect(readFileSync(join(outDir, 'storage-api.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.2.0; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.3.0; source of truth is runtime/spec; do not edit here\n' +
         STORAGE_SRC,
     );
     expect(readFileSync(join(outDir, 'event.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.3; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.4; source of truth is runtime/spec; do not edit here\n' +
         EVENT_SRC,
     );
     const second = sync({ specDir, outDir, landed });

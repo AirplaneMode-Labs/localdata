@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Copies the two contracts localdata vendors from the sibling runtime repository (../runtime/spec)
-// into src/contracts/, prepending the vendoring header: storage-api.ts @ 0.2.0 and event.ts @ 0.1.3.
+// into src/contracts/, prepending the vendoring header: storage-api.ts @ 0.3.0 and event.ts @ 0.1.4.
 // The source of truth is runtime/spec; never edit a vendored copy by hand.
 //
 // The copy is gated on the spec release's SPEC-LANDED.txt (one `sha256  path` line per spec file):
@@ -29,11 +29,11 @@ const repo = resolve(here, '..');
 export const DEFAULT_SPEC_DIR = resolve(repo, '..', 'runtime', 'spec');
 export const DEFAULT_OUT_DIR = resolve(repo, 'src', 'contracts');
 
-// Each contract carries its own version (spec release 0.4.0): the header names that contract's
+// Each contract carries its own version (spec release 0.5.0): the header names that contract's
 // version, not the release's.
 export const CONTRACT_VERSIONS = {
-  'storage-api.ts': '0.2.0',
-  'event.ts': '0.1.3',
+  'storage-api.ts': '0.3.0',
+  'event.ts': '0.1.4',
 };
 export const CONTRACT_FILES = Object.keys(CONTRACT_VERSIONS);
 
@@ -57,15 +57,16 @@ export function vendoredBody(text) {
 }
 
 /**
- * Parses `shasum -a 256` style lines into Map<listed path, sha256>. The key is the path exactly as
- * listed (a leading `./` removed), so `README.md` and `vectors/README.md` stay distinct. Lines that
- * are not `<64 hex>  <path>` are ignored.
+ * Parses `shasum -a 256` style lines into Map<listed path, sha256>. The key is the path as listed with a
+ * leading `./` and, since spec release 0.5.0, a single leading `spec/` removed (that release lists
+ * `spec/<path>`; earlier releases listed `<path>`), so `README.md` and `vectors/README.md` stay distinct
+ * and both listings read alike. Lines that are not `<64 hex>  <path>` are ignored.
  */
 export function parseLanded(text) {
   const map = new Map();
   for (const line of text.split('\n')) {
     const m = /^([0-9a-f]{64})\s+\*?(.+?)\s*$/u.exec(line.trim());
-    if (m) map.set(m[2].replace(/^\.\//u, ''), m[1]);
+    if (m) map.set(m[2].replace(/^\.\//u, '').replace(/^spec\//u, ''), m[1]);
   }
   return map;
 }
