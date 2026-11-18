@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Packs the SDK, checks the tarball against the packaging rules, installs it offline into a fresh
 // empty directory from an empty npm cache, and runs real calls from the installed copy: a key-value round
-// trip with its storage.* events, and the vector index (three rows written, one query, the keys printed).
+// trip with its storage.* events, the vector index (three rows written, one query, the keys printed), and the
+// documents API (a document put, queried with its chunk text and source pages, deleted, and a per-document
+// namespace cleared).
 // The two WebAssembly modules embedded in dist/index.js must equal a fresh path-remapped build
 // (scripts/build-wasm.mjs --check), and neither the tarball nor the decoded modules may hold a builder
 // path. Nothing here publishes anything.
@@ -247,6 +249,30 @@ await v.putVectors('docs', [
 const hits = await v.query('docs', new Float32Array([1, 0.1, 0]), 3);
 const info = await v.indexInfo('docs');
 await v.close();
+const docEvents = [];
+const d = await createStore({ driver: 'memory', events: { emit: (e) => docEvents.push(e) } });
+const f = (...x) => new Float32Array(x);
+const putResult = await d.putDocument(
+  'policies',
+  { docId: 'policy-3p', title: 'Policy 3P Title', sha256: 'a'.repeat(64), bytes: 1234, pages: 3 },
+  [
+    { ordinal: 0, pageStart: 1, pageEnd: 1, text: 'The grace period is 45 days.', vector: f(1, 0, 0, 0) },
+    { ordinal: 1, pageStart: 2, pageEnd: 3, text: 'Claims are settled within 30 days.', vector: f(0, 1, 0, 0) },
+  ],
+);
+const found = await d.queryChunks('policies', f(0.9, 0.1, 0, 0), 2);
+const docInfo = await d.getDocument('policies', 'policy-3p');
+const docUsage = await d.usage('policies');
+const docRemoved = await d.deleteDocument('policies', 'policy-3p');
+const afterDelete = await d.queryChunks('policies', f(1, 0, 0, 0), 2);
+await d.putDocument('dockit.dabc123', { docId: 'abc123', title: 'Per-document', sha256: 'b'.repeat(64), bytes: 1, pages: 1 }, [
+  { ordinal: 0, pageStart: 1, pageEnd: 1, text: 'only chunk', vector: f(1, 1, 0, 0) },
+]);
+await d.clear('dockit.dabc123');
+const afterClear = await d.listDocuments('dockit.dabc123');
+const afterClearUsage = (await d.usage('dockit.dabc123')).documents ?? null;
+await d.close();
+const docWire = JSON.stringify(docEvents);
 console.log(JSON.stringify({
   driver: s.driver,
   got,
@@ -258,6 +284,20 @@ console.log(JSON.stringify({
   firstValue: hits[0]?.value ?? null,
   rows: info?.rows,
   kernel: info?.kernel,
+  docs: {
+    put: putResult,
+    found: found.map((h) => [h.docId, h.ordinal, h.pageStart, h.pageEnd, h.text]),
+    info: { chunks: docInfo?.chunks, dim: docInfo?.dim, pages: docInfo?.pages },
+    usageDocuments: docUsage.documents ?? null,
+    removed: docRemoved,
+    afterDelete: afterDelete.length,
+    afterClear: afterClear.length,
+    afterClearUsage,
+    events: docEvents
+      .filter((e) => e.name.startsWith('storage.doc.'))
+      .map((e) => [e.name, e.attrs.outcome, e.attrs.ns]),
+    leaked: ['policy-3p', 'Policy 3P Title', 'grace period', 'abc123', 'Per-document', 'only chunk'].filter((x) => docWire.includes(x)),
+  },
 }));
 `;
 writeFileSync(join(fresh, 'probe.mjs'), probe);
@@ -287,6 +327,42 @@ check(
   `putVectors of 3 rows and a query from the installed copy print the keys ${JSON.stringify(r.keys)} (kernel ${r.kernel})`,
 );
 
+check(
+  JSON.stringify(r.docs.put) ===
+    JSON.stringify({ docId: 'policy-3p', chunks: 2, replaced: false, rows: 2 }) &&
+    r.docs.info.chunks === 2 &&
+    r.docs.info.dim === 4 &&
+    r.docs.usageDocuments === 1,
+  'putDocument of a 2-chunk document, getDocument and usage().documents from the installed copy',
+);
+check(
+  JSON.stringify(r.docs.found) ===
+    JSON.stringify([
+      ['policy-3p', 0, 1, 1, 'The grace period is 45 days.'],
+      ['policy-3p', 1, 2, 3, 'Claims are settled within 30 days.'],
+    ]),
+  'queryChunks from the installed copy returns the chunk text and the source pages, nearest first',
+);
+check(
+  r.docs.removed === true &&
+    r.docs.afterDelete === 0 &&
+    r.docs.afterClear === 0 &&
+    r.docs.afterClearUsage === null,
+  'deleteDocument hides every chunk; clear(ns) of a per-document namespace leaves no document and no usage',
+);
+check(
+  JSON.stringify(r.docs.events.map((e) => e[0])) ===
+    JSON.stringify([
+      'storage.doc.put',
+      'storage.doc.query',
+      'storage.doc.delete',
+      'storage.doc.query',
+      'storage.doc.put',
+    ]) && r.docs.events.at(-1)[2] === 'dockit.d*',
+  'the document events are storage.doc.put, query, delete, query, put, and the per-document namespace is redacted as dockit.d*',
+);
+check(r.docs.leaked.length === 0, 'no docId, title or chunk text appears in an emitted event');
+
 const summary = {
   tarball: packed.filename,
   sha256: createHash('sha256').update(readFileSync(tgz)).digest('hex'),
@@ -295,6 +371,7 @@ const summary = {
   files,
   installedPackages: deps,
   queryKeys: r.keys,
+  documents: r.docs,
   embeddedModuleSha256: shas,
   checks: failures.length === 0 ? 'all passed' : failures,
 };

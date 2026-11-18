@@ -143,6 +143,7 @@ export function summarise(rows) {
 
 const label = (s) => `${commas(s.rows)} x 384, ${commas(s.chunk)}-byte chunks`;
 const NM = 'not measured';
+const CELL = 'not measured on 8 GB';
 
 /** The README Benchmarks block, generated from the CSV rows only. */
 export function renderBench(rows) {
@@ -164,7 +165,7 @@ export function renderBench(rows) {
   lines.push('| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |');
   for (const s of sums) {
     lines.push(
-      `| ${label(s)} | ${s.driver} | ${s.n} | ${fmtMs(s.totalMedian)} | ${fmtMs(s.totalWorst)} | ${s.restartTotal === undefined ? '-' : fmtMs(s.restartTotal)} | ${(ROW_LIMIT_MS / s.totalWorst).toFixed(1)}x | ${NM} |`,
+      `| ${label(s)} | ${s.driver} | ${s.n} | ${fmtMs(s.totalMedian)} | ${fmtMs(s.totalWorst)} | ${s.restartTotal === undefined ? '-' : fmtMs(s.restartTotal)} | ${(ROW_LIMIT_MS / s.totalWorst).toFixed(1)}x | ${CELL} |`,
     );
   }
   lines.push('');
@@ -193,7 +194,7 @@ export function renderBench(rows) {
   for (const s of sums) {
     const pair = ([m, w]) => `${fmtMB(m)} / ${fmtMB(w)}`;
     lines.push(
-      `| ${label(s)} | ${s.driver} | ${pair(s.indexBytes)} | ${pair(s.wasm)} | ${pair(s.heap)} | ${pair(s.usage)} | ${NM} |`,
+      `| ${label(s)} | ${s.driver} | ${pair(s.indexBytes)} | ${pair(s.wasm)} | ${pair(s.heap)} | ${pair(s.usage)} | ${CELL} |`,
     );
   }
   lines.push('');
