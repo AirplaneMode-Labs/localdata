@@ -5,9 +5,13 @@ import { StorageError } from '../contracts/storage-api';
 import { toStorageError } from '../errors';
 import {
   STORAGE_ROOT,
+  isIndexNamespace,
+  userNamespace,
+  type BoundedRead,
   type DriverHooks,
   type DriverPutMeta,
   type DriverRecord,
+  type ReadLimit,
   type StorageDriver,
 } from './types';
 
@@ -34,6 +38,52 @@ async function sha256Hex(text: string): Promise<string> {
 
 function isNotFound(e: unknown): boolean {
   return (e as { name?: unknown } | null)?.name === 'NotFoundError';
+}
+
+const HASH_FILE = /^[0-9a-f]{64}$/;
+
+/**
+ * Parses keys.json. `strict` (a vector or document namespace) demands the exact shape this driver writes
+ * and returns undefined for anything else; the lenient form (key-value namespaces) skips entries it cannot
+ * use, as it always has. Undefined means "not a usable index file".
+ */
+function parseIndexFile(text: string, strict: boolean): Map<string, IndexEntry> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+  const file = parsed as { v?: unknown; k?: unknown };
+  if (file.v !== 1 || typeof file.k !== 'object' || file.k === null || Array.isArray(file.k))
+    return undefined;
+  const m = new Map<string, IndexEntry>();
+  for (const [k, v] of Object.entries(file.k as Record<string, IndexEntry>)) {
+    const usable =
+      v !== null &&
+      typeof v === 'object' &&
+      typeof v.h === 'string' &&
+      typeof v.s === 'number' &&
+      (!strict ||
+        (HASH_FILE.test(v.h) &&
+          Number.isSafeInteger(v.s) &&
+          v.s >= 0 &&
+          (v.e === undefined || Number.isFinite(v.e))));
+    if (usable) m.set(k, v);
+    else if (strict) return undefined;
+  }
+  return m;
+}
+
+/** S1-092: a damaged keys.json of an index namespace is corruption, never an empty index. */
+function keysJsonCorrupt(ns: string): StorageError {
+  const user = userNamespace(ns);
+  return new StorageError(
+    'corrupt',
+    `the stored index of namespace ${JSON.stringify(user)} failed validation (keys_json in keys.json)`,
+    { ns: user, file: INDEX_FILE, reason: 'keys_json' },
+  );
 }
 
 export class OpfsDriver implements StorageDriver, DriverHooks {
@@ -100,20 +150,23 @@ export class OpfsDriver implements StorageDriver, DriverHooks {
   private async loadIndex(ns: string): Promise<Map<string, IndexEntry>> {
     const cached = this.indexes.get(ns);
     if (cached) return cached;
-    const m = new Map<string, IndexEntry>();
+    let m = new Map<string, IndexEntry>();
     const dir = await this.nsDir(ns, false);
     if (dir) {
+      let text: string | undefined;
       try {
-        const fh = await dir.getFileHandle(INDEX_FILE);
-        const text = await (await fh.getFile()).text();
-        const parsed = JSON.parse(text) as IndexFile;
-        if (parsed && parsed.v === 1 && parsed.k && typeof parsed.k === 'object') {
-          for (const [k, v] of Object.entries(parsed.k)) {
-            if (v && typeof v.h === 'string' && typeof v.s === 'number') m.set(k, v);
-          }
-        }
+        text = await (await (await dir.getFileHandle(INDEX_FILE)).getFile()).text();
       } catch (e) {
-        if (!isNotFound(e) && !(e instanceof SyntaxError)) throw e;
+        if (!isNotFound(e)) throw e;
+      }
+      if (text !== undefined) {
+        const strict = isIndexNamespace(ns);
+        const parsed = parseIndexFile(text, strict);
+        if (parsed === undefined) {
+          // Key-value namespaces keep the tolerant behaviour (documented in Limitations); a vector or
+          // document namespace refuses, so an unreadable index never looks like an empty one.
+          if (strict) throw keysJsonCorrupt(ns);
+        } else m = parsed;
       }
     }
     this.indexes.set(ns, m);
@@ -162,29 +215,48 @@ export class OpfsDriver implements StorageDriver, DriverHooks {
 
   async getBytes(ns: string, key: string): Promise<DriverRecord | undefined> {
     try {
-      const m = await this.loadIndex(ns);
-      const entry = m.get(key);
-      if (!entry) return undefined;
-      const dir = await this.nsDir(ns, false);
-      if (!dir) return undefined;
-      let file: File;
-      try {
-        file = await (await dir.getFileHandle(entry.h)).getFile();
-      } catch (e) {
-        if (isNotFound(e)) {
-          m.delete(key);
-          await this.saveIndex(ns, dir, m);
-          return undefined;
-        }
-        throw e;
-      }
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const rec: DriverRecord = { bytes, meta: { size: entry.s } };
-      if (entry.e !== undefined) rec.meta.expiresAt = entry.e;
-      return rec;
+      const r = await this.read(ns, key);
+      return r.kind === 'ok' ? r.record : undefined;
     } catch (e) {
       throw toStorageError(e, 'opfs getBytes');
     }
+  }
+
+  /** S1-092: the record is read only if its File.size satisfies `limit`; otherwise nothing is read. */
+  async getBytesBounded(ns: string, key: string, limit: ReadLimit): Promise<BoundedRead> {
+    try {
+      return await this.read(ns, key, limit);
+    } catch (e) {
+      throw toStorageError(e, 'opfs getBytes');
+    }
+  }
+
+  private async read(ns: string, key: string, limit?: ReadLimit): Promise<BoundedRead> {
+    const m = await this.loadIndex(ns);
+    const entry = m.get(key);
+    if (!entry) return { kind: 'absent' };
+    const dir = await this.nsDir(ns, false);
+    if (!dir) return { kind: 'absent' };
+    let file: File;
+    try {
+      file = await (await dir.getFileHandle(entry.h)).getFile();
+    } catch (e) {
+      if (isNotFound(e)) {
+        m.delete(key);
+        await this.saveIndex(ns, dir, m);
+        return { kind: 'absent' };
+      }
+      throw e;
+    }
+    // The size is known from the file's metadata; decide before reading a single byte (S1-092).
+    if (limit?.exact !== undefined && file.size !== limit.exact)
+      return { kind: 'size', actual: file.size };
+    if (limit?.max !== undefined && file.size > limit.max)
+      return { kind: 'size', actual: file.size };
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const record: DriverRecord = { bytes, meta: { size: entry.s } };
+    if (entry.e !== undefined) record.meta.expiresAt = entry.e;
+    return { kind: 'ok', record };
   }
 
   async del(ns: string, key: string): Promise<boolean> {

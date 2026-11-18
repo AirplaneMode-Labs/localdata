@@ -1,6 +1,6 @@
-// @airplanemode/localdata: set/get/delete/query over OPFS with an IndexedDB fallback, plus a flat
-// vector index (putVectors/query) persisted beside the values.
-// Implements the Storage API contract 0.2.0 vendored from AirplaneMode-Labs/runtime spec/.
+// @airplanemode/localdata: set/get/delete/query over OPFS with an IndexedDB fallback, a flat vector
+// index (putVectors/query) and a documents API (putDocument/queryChunks/deleteDocument) persisted beside
+// the values. Implements the Storage API contract 0.3.0 vendored from AirplaneMode-Labs/runtime spec/.
 import { StorageError, type StorageDriver } from './contracts/storage-api';
 import { IndexedDbDriver } from './drivers/indexeddb';
 import { MemoryDriver } from './drivers/memory';
@@ -38,9 +38,10 @@ export interface CreateStoreOptions {
   /** Injectable clock in epoch milliseconds (TTL); defaults to Date.now. */
   clock?: () => number;
   /**
-   * Optional EventSink receiving storage.set, storage.get, storage.delete and storage.quota events
-   * (Event 0.1.2, source "localdata"). Never receives a key, prefix or value; the namespace does
-   * appear. Called synchronously inside try/catch and never awaited.
+   * Optional EventSink receiving the storage.* events (Event 0.1.4, source "localdata": set, get, delete,
+   * quota, query, index.open, index.write and the documents' doc.put, doc.delete, doc.query). Never receives
+   * a key, prefix, value, docId, title or chunk text; the namespace does appear (a namespace under a
+   * registered prefix, 'dockit.d' by default, appears as prefix + '*'). Called synchronously inside try/catch and never awaited.
    */
   events?: EventSink;
   /** Session id for events (1..64 chars); pass the runtime's sessionId() to share one id. */

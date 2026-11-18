@@ -189,21 +189,30 @@ async function commitHead(ctx: WriteCtx, head: Uint8Array): Promise<void> {
 }
 
 /**
- * Tombstones the live row of `key`: a new HEAD with one more bit set and generation + 1. Returns false
- * when the key has no live row. The resident index is updated in place after the HEAD lands.
+ * Tombstones the live rows of `keys` in ONE new HEAD (generation + 1). Keys without a live row are
+ * skipped. Returns how many rows were tombstoned (0 writes nothing). The resident index is updated in
+ * place after the HEAD lands.
  */
-export async function tombstoneKey(ctx: WriteCtx, idx: OpenIndex, key: string): Promise<boolean> {
-  const row = idx.live.get(key);
-  if (row === undefined) return false;
+export async function tombstoneKeys(
+  ctx: WriteCtx,
+  idx: OpenIndex,
+  keys: Iterable<string>,
+): Promise<number> {
+  const hit = new Map<string, number>();
+  for (const key of keys) {
+    const row = idx.live.get(key);
+    if (row !== undefined) hit.set(key, row);
+  }
+  if (hit.size === 0) return 0;
   const generation = nextGeneration(idx);
   const tomb = idx.tomb.slice();
-  tomb[row >> 3] = tomb[row >> 3]! | (1 << (row & 7));
+  for (const row of hit.values()) tomb[row >> 3] = tomb[row >> 3]! | (1 << (row & 7));
   const head = buildHead(ctx.kernel, {
     dim: idx.dim,
     generation,
     nextSegId: idx.nextSegId,
     totalRows: idx.totalRows,
-    liveRows: idx.liveRows - 1,
+    liveRows: idx.liveRows - hit.size,
     segs: segFieldsOf(idx),
     tomb,
   });
@@ -211,9 +220,34 @@ export async function tombstoneKey(ctx: WriteCtx, idx: OpenIndex, key: string): 
   idx.headBytes = head;
   idx.tomb = tomb;
   idx.generation = generation;
-  idx.liveRows -= 1;
-  idx.live.delete(key);
-  return true;
+  idx.liveRows -= hit.size;
+  for (const key of hit.keys()) idx.live.delete(key);
+  return hit.size;
+}
+
+/**
+ * Tombstones the live row of `key`: a new HEAD with one more bit set and generation + 1. Returns false
+ * when the key has no live row.
+ */
+export async function tombstoneKey(ctx: WriteCtx, idx: OpenIndex, key: string): Promise<boolean> {
+  return (await tombstoneKeys(ctx, idx, [key])) > 0;
+}
+
+/** Options of putVectors beyond the rows themselves (used by the documents layer). */
+export interface PutOptions {
+  /**
+   * Keys whose live rows are tombstoned in the SAME commit as the new rows, in addition to the rows the
+   * call replaces by key (a document replaced by one with fewer chunks must retire the chunks it no
+   * longer has).
+   */
+  retire?: readonly string[];
+  /**
+   * Starts a new index (a new dim, none of the old segments) instead of extending the committed one. New
+   * segments still take ids from the committed nextSegId and the generation still rises, so the committed
+   * HEAD stays valid until the new HEAD lands; the old segments' parts become unreferenced and the sweep
+   * on open removes them.
+   */
+  restart?: boolean;
 }
 
 class SegmentBuilder {
@@ -268,14 +302,18 @@ export async function putVectors(
   idx: OpenIndex | undefined,
   rows: Iterable<VectorRow> | AsyncIterable<VectorRow>,
   maxIndexBytes: number,
+  opts: PutOptions = {},
 ): Promise<PutOutcome> {
   const { kernel, files } = ctx;
+  // `idx` supplies the generation and the next segment id (the committed HEAD must stay valid until the new
+  // one lands); `base` is what the new HEAD extends: the committed index, or nothing for a restart.
+  const base = opts.restart === true ? undefined : idx;
   const generation = nextGeneration(idx);
-  const adopt = idx?.vecLoaded === true;
-  const oldRows = idx?.totalRows ?? 0;
-  const oldSegs = idx?.segments.length ?? 0;
-  const oldIndexBytes = (idx?.vecBytes ?? 0) + (idx?.metaBytes ?? 0);
-  let dim = idx?.dim ?? 0;
+  const adopt = base?.vecLoaded === true;
+  const oldRows = base?.totalRows ?? 0;
+  const oldSegs = base?.segments.length ?? 0;
+  const oldIndexBytes = (base?.vecBytes ?? 0) + (base?.metaBytes ?? 0);
+  let dim = base?.dim ?? 0;
 
   const seen = new Set<string>();
   const finished: FinishedSegment[] = [];
@@ -542,20 +580,26 @@ export async function putVectors(
     }
     await finishSegment();
 
-    // Replaced rows: every key of this call that has a live row in the committed index.
-    const replacedRows: number[] = [];
-    if (idx !== undefined) {
+    // Replaced rows: every key of this call that has a live row in the committed index, and every key the
+    // caller retires in the same commit (each row once).
+    const replacedSet = new Set<number>();
+    if (base !== undefined) {
       for (const k of seen) {
-        const old = idx.live.get(k);
-        if (old !== undefined) replacedRows.push(old);
+        const old = base.live.get(k);
+        if (old !== undefined) replacedSet.add(old);
+      }
+      for (const k of opts.retire ?? []) {
+        const old = base.live.get(k);
+        if (old !== undefined) replacedSet.add(old);
       }
     }
+    const replacedRows = [...replacedSet];
     const totalRows = oldRows + callRow;
     const tomb = new Uint8Array(Math.ceil(totalRows / 8));
-    if (idx !== undefined) tomb.set(idx.tomb);
+    if (base !== undefined) tomb.set(base.tomb);
     for (const row of replacedRows) tomb[row >> 3] = tomb[row >> 3]! | (1 << (row & 7));
-    const liveRows = (idx?.liveRows ?? 0) - replacedRows.length + callRow;
-    const segs: SegFields[] = [...(idx ? segFieldsOf(idx) : []), ...finished];
+    const liveRows = (base?.liveRows ?? 0) - replacedRows.length + callRow;
+    const segs: SegFields[] = [...(base ? segFieldsOf(base) : []), ...finished];
     const head = buildHead(kernel, {
       dim,
       generation,
@@ -573,7 +617,8 @@ export async function putVectors(
     // Committed. Extend the resident index in place when it holds vectors (their blocks are already
     // in WebAssembly memory); otherwise the caller drops it and reloads lazily.
     let invalidate = true;
-    if (idx !== undefined && adopt) {
+    if (base !== undefined && adopt) {
+      const idx = base;
       for (const row of replacedRows) idx.live.delete(idx.keys[row]!);
       let first = oldRows;
       for (const f of finished) {

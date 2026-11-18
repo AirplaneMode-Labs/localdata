@@ -19,7 +19,7 @@ import {
   type EventLevel,
   type EventSink,
 } from './contracts/event';
-import { STORAGE_NS_PATTERN, type StorageErrorCode } from './contracts/storage-api';
+import { STORAGE_NS_PATTERN, StorageError, type StorageErrorCode } from './contracts/storage-api';
 
 export const STORAGE_EVENT_SOURCE = 'localdata';
 
@@ -98,10 +98,19 @@ export function eventOptionProblem(opts: {
   return undefined;
 }
 
+/** Namespace prefixes the SDK itself redacts in events: dockit keeps one namespace per document. */
+export const BUILTIN_REDACTED_PREFIXES: readonly string[] = Object.freeze(['dockit.d']);
+/** At most this many prefixes can be registered through redactNamespacePrefix(). */
+export const REDACTED_PREFIXES_MAX = 16;
+
+export type DocPutOutcome = 'ok' | StorageErrorCode;
+export type DocDeleteOutcome = 'removed' | 'absent' | StorageErrorCode;
+
 /** Emits the storage.* events of one store. Construct with no sink for a zero-cost no-op. */
 export class StorageEvents {
   private readonly driver: string;
   private emitting = false;
+  private readonly redacted: string[] = [...BUILTIN_REDACTED_PREFIXES];
 
   constructor(
     private readonly sink: EventSink | undefined,
@@ -172,7 +181,10 @@ export class StorageEvents {
     );
   }
 
-  /** storage.index.open: one event per load of an index (HEAD and META, and vectors when loaded). */
+  /**
+   * storage.index.open: one event per load of an index (HEAD and META, and vectors when loaded).
+   * `swept` is the number of unreferenced index records deleted by this open (T1-S4-08), 0 when none.
+   */
   indexOpen(
     startedAt: number,
     ns: string,
@@ -182,6 +194,7 @@ export class StorageEvents {
     reason: string,
     kernel: string,
     bytes: number,
+    swept = 0,
   ): void {
     this.timing(
       'storage.index.open',
@@ -190,7 +203,7 @@ export class StorageEvents {
       outcome,
       outcome === 'ok' || outcome === 'absent' ? 'debug' : 'warn',
       bytes,
-      { rows, segments, reason, kernel },
+      { rows, segments, reason, kernel, swept },
     );
   }
 
@@ -216,6 +229,76 @@ export class StorageEvents {
   }
 
   /**
+   * redactNamespacePrefix (Storage API 0.3.0): a namespace that starts with `prefix` is emitted in event
+   * attrs as prefix + '*', so an application that keeps one namespace per document never shows a document
+   * id in an event. Takes effect for every storage.* event of this store.
+   */
+  redact(prefix: unknown): void {
+    if (typeof prefix !== 'string' || !STORAGE_NS_PATTERN.test(prefix)) {
+      throw new StorageError(
+        'invalid_namespace',
+        'invalid prefix: it must match ^[a-z0-9][a-z0-9._-]{0,63}$ (the namespace grammar)',
+      );
+    }
+    if (this.redacted.includes(prefix)) return;
+    if (this.redacted.length - BUILTIN_REDACTED_PREFIXES.length >= REDACTED_PREFIXES_MAX) {
+      throw new StorageError(
+        'invalid_value',
+        `at most ${REDACTED_PREFIXES_MAX} prefixes can be registered for redaction`,
+      );
+    }
+    this.redacted.push(prefix);
+  }
+
+  /** storage.doc.put: attrs ns, driver, outcome, chunks, replaced, rows; bytes written. Never a docId or text. */
+  docPut(
+    startedAt: number,
+    ns: string,
+    outcome: DocPutOutcome,
+    chunks: number,
+    replaced: boolean,
+    rows: number,
+    bytes?: number,
+  ): void {
+    this.timing(
+      'storage.doc.put',
+      startedAt,
+      ns,
+      outcome,
+      outcome === 'ok' ? 'debug' : 'warn',
+      bytes,
+      { chunks, replaced, rows },
+    );
+  }
+
+  /** storage.doc.delete: attrs ns, driver, outcome 'removed' | 'absent' | StorageErrorCode. */
+  docDelete(startedAt: number, ns: string, outcome: DocDeleteOutcome): void {
+    const quiet = outcome === 'removed' || outcome === 'absent';
+    this.timing('storage.doc.delete', startedAt, ns, outcome, quiet ? 'debug' : 'warn');
+  }
+
+  /** storage.doc.query: attrs ns, driver, outcome, k, candidates, metric, kernel. Never the vector, docId or scores. */
+  docQuery(
+    startedAt: number,
+    ns: string,
+    outcome: string,
+    k: number,
+    candidates: number,
+    metric: string,
+    kernel: string,
+  ): void {
+    this.timing(
+      'storage.doc.query',
+      startedAt,
+      ns,
+      outcome,
+      outcome === 'ok' ? 'debug' : 'warn',
+      undefined,
+      { k: Number.isInteger(k) ? k : -1, candidates, metric, kernel },
+    );
+  }
+
+  /**
    * storage.quota. `ns` is '' for all namespaces. `quota` is the SDK soft quota, or null when there
    * is none or when the browser (which does not say what its limit is) refused the write. `needed` is
    * 0 from usage(); on a refused set it is the bytes that did not fit: the exact shortfall for the
@@ -231,7 +314,7 @@ export class StorageEvents {
     if (this.sink === undefined) return;
     this.deliver('log', 'storage.quota', level, {
       driver: this.driver,
-      ns: validNs(ns),
+      ns: this.validNs(ns),
       usage,
       quota,
       needed,
@@ -252,10 +335,20 @@ export class StorageEvents {
       'timing',
       name,
       level,
-      { ns: validNs(ns), driver: this.driver, outcome, ...(extra ?? {}) },
+      { ns: this.validNs(ns), driver: this.driver, outcome, ...(extra ?? {}) },
       Math.max(0, monotonicNow() - startedAt),
       bytes,
     );
+  }
+
+  /**
+   * The namespace as it may appear in an event: itself when valid, 'prefix*' when it starts with a
+   * redacted prefix, otherwise '' (never the raw string).
+   */
+  private validNs(ns: string): string {
+    if (typeof ns !== 'string' || !STORAGE_NS_PATTERN.test(ns)) return '';
+    for (const p of this.redacted) if (ns.startsWith(p)) return `${p}*`;
+    return ns;
   }
 
   private deliver(
@@ -294,9 +387,4 @@ export class StorageEvents {
       this.emitting = false;
     }
   }
-}
-
-/** The namespace as it may appear in an event: itself when valid, otherwise '' (never the raw string). */
-function validNs(ns: string): string {
-  return typeof ns === 'string' && STORAGE_NS_PATTERN.test(ns) ? ns : '';
 }

@@ -18,15 +18,21 @@ import {
   type VectorIndexInfo,
   type VectorRow,
 } from '../contracts/storage-api';
-import type { DriverHooks } from '../drivers/types';
+import { DOC_NS_PREFIX, VEC_NS_PREFIX, type DriverHooks } from '../drivers/types';
 import { toStorageError } from '../errors';
 import type { StorageEvents } from '../events';
 import { Kernel, KernelTrapError, type KernelChoice, type KernelKind } from './kernel';
-import { VEC_NS_PREFIX, VecFiles, corrupt } from './files';
+import { VecFiles, corrupt, referencedRecords } from './files';
 import { OpenIndex, loadMeta, loadVec, readValue, type LoadCtx } from './reader';
 import { TopK } from './topk';
 import { checkFilterPrefix, checkK, checkMetric, checkQueryVector } from './validate';
-import { putVectors as writePutVectors, tombstoneKey, type WriteCtx } from './writer';
+import {
+  putVectors as writePutVectors,
+  tombstoneKey,
+  type PutOptions,
+  type PutOutcome,
+  type WriteCtx,
+} from './writer';
 
 export interface VectorStoreOptions {
   driver: StorageDriver;
@@ -35,11 +41,16 @@ export interface VectorStoreOptions {
   maxIndexBytes: number;
   /** Throws quota_exceeded when `additionalBytes` more bytes in `ns` would pass the soft quota. */
   checkSoft(ns: string, additionalBytes: number): void;
+  /**
+   * The reserved driver namespace prefix this store's indexes live under: '__ld_vec.' (the default, the
+   * generic vector index) or '__ld_doc.' (the documents API, src/docs).
+   */
+  prefix?: string;
 }
 
 type State = 'unknown' | 'absent' | 'meta' | 'full' | 'corrupt';
 
-interface Entry {
+export interface Entry {
   ns: string;
   files: VecFiles;
   state: State;
@@ -48,6 +59,8 @@ interface Entry {
   headSig: string;
   stuck: StorageError | undefined;
   chain: Promise<unknown>;
+  /** Derived state a subclass keeps beside the index (the documents view); dropped with the entry. */
+  ext: unknown;
 }
 
 function sig(bytes: Uint8Array): string {
@@ -62,42 +75,72 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-function withWebLock<T>(ns: string, fn: () => Promise<T>): Promise<T> {
+export function withWebLock<T>(lockName: string, fn: () => Promise<T>): Promise<T> {
   const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
   if (locks && typeof locks.request === 'function') {
-    return locks.request(
-      `airplanemode-localdata:vec:${ns}`,
-      { mode: 'exclusive' },
-      fn,
-    ) as Promise<T>;
+    return locks.request(lockName, { mode: 'exclusive' }, fn) as Promise<T>;
   }
   return fn();
 }
 
+/**
+ * Like withWebLock, but never waits: when another writer holds the lock, `fn` is skipped and undefined is
+ * returned. Used by the open-time sweep, which must not block a reader behind a long write and must not
+ * delete parts a writer in another tab has put but not yet committed.
+ */
+function tryWebLock<T>(lockName: string, fn: () => Promise<T>): Promise<T | undefined> {
+  const locks = (globalThis as { navigator?: { locks?: LockManager } }).navigator?.locks;
+  if (locks && typeof locks.request === 'function') {
+    return locks.request(lockName, { mode: 'exclusive', ifAvailable: true }, async (lock) =>
+      lock === null ? undefined : fn(),
+    ) as Promise<T | undefined>;
+  }
+  return fn();
+}
+
+/** A row filter for scan(): which rows are candidates, how many results to keep at most, and the tie key. */
+export interface ScanFilter {
+  /** True for a row that is a candidate (tombstoned rows are already skipped). */
+  row(row: number): boolean;
+  /** Upper bound on the candidates: the result keeps min(k, capacity). */
+  capacity: number;
+  /** Maps a stored key to the string whose UTF-8 order breaks exact score ties. */
+  tieKey?(key: string): string;
+}
+
 export class VectorStore {
-  private readonly d: StorageDriver & DriverHooks;
+  protected readonly d: StorageDriver & DriverHooks;
   private readonly entries = new Map<string, Entry>();
-  private kernel: Kernel | undefined;
+  protected kernel: Kernel | undefined;
   private kernelP: Promise<Kernel> | undefined;
   private closed = false;
+  /** The reserved driver namespace prefix of this store's indexes. */
+  protected readonly prefix: string;
 
-  constructor(private readonly o: VectorStoreOptions) {
+  constructor(protected readonly o: VectorStoreOptions) {
     this.d = o.driver as StorageDriver & DriverHooks;
+    this.prefix = o.prefix ?? VEC_NS_PREFIX;
+  }
+
+  /** The Web Lock name the writers of one index take: one lock per namespace and kind of index. */
+  protected lockName(ns: string): string {
+    return `airplanemode-localdata:${this.prefix === DOC_NS_PREFIX ? 'doc' : 'vec'}:${ns}`;
   }
 
   // ---- plumbing -----------------------------------------------------------------------------
 
-  private entry(ns: string): Entry {
+  protected entry(ns: string): Entry {
     let e = this.entries.get(ns);
     if (!e) {
       e = {
         ns,
-        files: new VecFiles(this.o.driver, ns),
+        files: new VecFiles(this.o.driver, ns, this.prefix),
         state: 'unknown',
         idx: undefined,
         headSig: '',
         stuck: undefined,
         chain: Promise.resolve(),
+        ext: undefined,
       };
       this.entries.set(ns, e);
     }
@@ -105,7 +148,7 @@ export class VectorStore {
   }
 
   /** Serialises work on one namespace inside this store. */
-  private exclusive<T>(e: Entry, fn: () => Promise<T>): Promise<T> {
+  protected exclusive<T>(e: Entry, fn: () => Promise<T>): Promise<T> {
     const run = e.chain.then(fn, fn);
     e.chain = run.then(
       () => undefined,
@@ -114,7 +157,7 @@ export class VectorStore {
     return run;
   }
 
-  private async getKernel(): Promise<Kernel> {
+  protected async getKernel(): Promise<Kernel> {
     if (this.kernel?.alive) return this.kernel;
     if (this.kernel) this.discardKernel();
     this.kernelP ??= Kernel.create(this.o.kernel).then(
@@ -149,7 +192,7 @@ export class VectorStore {
     return this.kernel?.kind ?? 'none';
   }
 
-  private convert(e: unknown, ns: string, write: boolean, context: string): StorageError {
+  protected convert(e: unknown, ns: string, write: boolean, context: string): StorageError {
     if (e instanceof KernelTrapError) {
       this.discardKernel();
       return write
@@ -168,15 +211,15 @@ export class VectorStore {
     return toStorageError(e, context);
   }
 
-  private ctx(e: Entry, kernel: Kernel): LoadCtx {
+  protected ctx(e: Entry, kernel: Kernel): LoadCtx {
     return { kernel, files: e.files, ns: e.ns, maxIndexBytes: this.o.maxIndexBytes };
   }
 
-  private wctx(e: Entry, kernel: Kernel): WriteCtx {
+  protected wctx(e: Entry, kernel: Kernel): WriteCtx {
     return { ...this.ctx(e, kernel), checkSoft: (n) => this.o.checkSoft(e.ns, n) };
   }
 
-  private stick(e: Entry, err: StorageError): void {
+  protected stick(e: Entry, err: StorageError): void {
     e.idx?.dispose();
     e.idx = undefined;
     e.state = 'corrupt';
@@ -189,7 +232,7 @@ export class VectorStore {
    * namespace keeps rejecting until its HEAD changes. `quiet` suppresses the storage.index.open event
    * (usage() and delete() are KV-flavoured calls and must not add events of their own).
    */
-  private async ensure(
+  protected async ensure(
     e: Entry,
     need: 'meta' | 'full',
     quiet = false,
@@ -211,18 +254,21 @@ export class VectorStore {
     const t0 = this.o.events.start();
     let outcome = 'ok';
     let reason = '';
+    let swept = 0;
     try {
       if (e.state === 'unknown') {
         const head = await e.files.head();
         if (head === undefined) {
           e.state = 'absent';
           outcome = 'absent';
+          swept = await this.sweepUnreferenced(e, undefined);
           return undefined;
         }
         const kernel = await this.getKernel();
         e.headSig = sig(head);
         e.idx = await loadMeta(this.ctx(e, kernel), head);
         e.state = 'meta';
+        swept = await this.sweepUnreferenced(e, e.idx);
       }
       if (need === 'full' && e.idx !== undefined) {
         await loadVec(this.ctx(e, e.idx.kernel), e.idx);
@@ -250,8 +296,36 @@ export class VectorStore {
           reason,
           this.kernelKind(),
           e.idx?.bytes ?? 0,
+          swept,
         );
       }
+    }
+  }
+
+  /**
+   * T1-S4-08: deletes this namespace's part records that no committed HEAD references (parts of a write
+   * that never committed) and returns how many. Runs once per load of the index, only if the writer lock
+   * is free (a writer in another tab is never raced) and only if HEAD is still the one just read; any
+   * failure leaves the records for the next open. Inside e's mutex.
+   */
+  private async sweepUnreferenced(e: Entry, idx: OpenIndex | undefined): Promise<number> {
+    try {
+      const n = await tryWebLock(this.lockName(e.ns), async () => {
+        this.d.refreshIndex?.(e.files.vns);
+        const head = await e.files.head();
+        if (
+          idx === undefined
+            ? head !== undefined
+            : head === undefined || !sameBytes(head, idx.headBytes)
+        )
+          return 0;
+        return e.files.sweep(
+          idx === undefined ? new Set() : referencedRecords(idx.dim, idx.segments),
+        );
+      });
+      return n ?? 0;
+    } catch {
+      return 0;
     }
   }
 
@@ -260,7 +334,7 @@ export class VectorStore {
    * index when its HEAD changed (another tab wrote). Returns the up-to-date resident index (meta
    * loaded), or undefined for a namespace without an index.
    */
-  private async refreshForWrite(e: Entry): Promise<OpenIndex | undefined> {
+  protected async refreshForWrite(e: Entry): Promise<OpenIndex | undefined> {
     this.d.refreshIndex?.(e.files.vns);
     this.freshen(e);
     const head = await e.files.head();
@@ -377,12 +451,13 @@ export class VectorStore {
   }
 
   /** Scores every block and keeps the best min(k, candidates). Synchronous: the index cannot change. */
-  private scan(
+  protected scan(
     idx: OpenIndex,
     q: Float32Array,
     k: number,
     metric: 0 | 1,
     prefix: string | undefined,
+    accept?: ScanFilter,
   ): { top: Array<{ row: number; score: number }>; candidates: number } {
     const kernel = idx.kernel;
     const dim = idx.dim;
@@ -396,7 +471,10 @@ export class VectorStore {
       kernel.f32(qPtr, dim).set(q);
       if (kernel.invNorms(qPtr, 1, dim, qn) !== 0) throw new StorageError('io', 'kernel arguments');
       const qInv = kernel.f32(qn, 1)[0]!;
-      const top = new TopK(Math.min(k, idx.liveRows), (row) => idx.keys[row]!);
+      const top = new TopK(
+        Math.min(k, accept?.capacity ?? idx.liveRows),
+        accept?.tieKey ? (row) => accept.tieKey!(idx.keys[row]!) : (row) => idx.keys[row]!,
+      );
       const hasTomb = idx.liveRows !== idx.totalRows;
       let candidates = 0;
       for (const s of idx.segments) {
@@ -414,7 +492,7 @@ export class VectorStore {
           if (rc !== 0) throw new StorageError('io', 'kernel arguments');
           const scores = kernel.f32(outPtr, b.rows);
           const base = s.firstRow + b.start;
-          if (!hasTomb && prefix === undefined) {
+          if (!hasTomb && prefix === undefined && accept === undefined) {
             candidates += b.rows;
             for (let i = 0; i < b.rows; i++) top.push(scores[i]!, base + i);
           } else {
@@ -422,6 +500,7 @@ export class VectorStore {
               const row = base + i;
               if (hasTomb && idx.isDeleted(row)) continue;
               if (prefix !== undefined && !idx.keys[row]!.startsWith(prefix)) continue;
+              if (accept !== undefined && !accept.row(row)) continue;
               candidates++;
               top.push(scores[i]!, row);
             }
@@ -459,21 +538,15 @@ export class VectorStore {
       }
       const e = this.entry(ns);
       return await this.exclusive(e, () =>
-        withWebLock(ns, async () => {
+        withWebLock(this.lockName(ns), async () => {
           const idx = await this.refreshForWrite(e);
-          const kernel = await this.getKernel();
-          const out = await writePutVectors(this.wctx(e, kernel), idx, rows, this.o.maxIndexBytes);
+          const out = await this.commitRows(e, idx, rows);
           stats = {
             rows: out.result.rows,
             replaced: out.result.replaced,
             segments: out.segments,
             bytes: out.bytes,
           };
-          if (out.invalidate) {
-            e.idx?.dispose();
-            e.idx = undefined;
-            e.state = out.result.written > 0 ? 'unknown' : e.state;
-          }
           return out.result;
         }),
       );
@@ -492,6 +565,27 @@ export class VectorStore {
         stats.bytes,
       );
     }
+  }
+
+  /**
+   * Writes `rows` as one all-or-nothing commit on top of `idx` (the up-to-date resident index from
+   * refreshForWrite, or undefined) and drops the resident copy when it could not be extended in place.
+   * Inside e's mutex and the writer lock.
+   */
+  protected async commitRows(
+    e: Entry,
+    idx: OpenIndex | undefined,
+    rows: Iterable<VectorRow> | AsyncIterable<VectorRow>,
+    opts?: PutOptions,
+  ): Promise<PutOutcome> {
+    const kernel = await this.getKernel();
+    const out = await writePutVectors(this.wctx(e, kernel), idx, rows, this.o.maxIndexBytes, opts);
+    if (out.invalidate) {
+      e.idx?.dispose();
+      e.idx = undefined;
+      e.state = out.result.written > 0 ? 'unknown' : e.state;
+    }
+    return out;
   }
 
   async indexInfo(ns: string): Promise<VectorIndexInfo | undefined> {
@@ -529,7 +623,7 @@ export class VectorStore {
           e.state = 'absent';
           return false;
         }
-        return withWebLock(ns, async () => {
+        return withWebLock(this.lockName(ns), async () => {
           const idx = await this.refreshForWrite(e);
           if (idx === undefined) return false;
           const kernel = await this.getKernel();
@@ -553,7 +647,7 @@ export class VectorStore {
     try {
       const e = this.entry(ns);
       await this.exclusive(e, () =>
-        withWebLock(ns, async () => {
+        withWebLock(this.lockName(ns), async () => {
           this.d.refreshIndex?.(e.files.vns);
           e.idx?.dispose();
           e.idx = undefined;
@@ -561,6 +655,7 @@ export class VectorStore {
           e.state = 'absent';
           e.stuck = undefined;
           e.headSig = '';
+          e.ext = undefined;
         }),
       );
     } catch (err) {
@@ -569,7 +664,7 @@ export class VectorStore {
   }
 
   /** Index rows and bytes of one namespace, or undefined (no index, or an index that is corrupt). */
-  private async usageOne(ns: string): Promise<{ rows: number; bytes: number } | undefined> {
+  protected async usageOne(ns: string): Promise<{ rows: number; bytes: number } | undefined> {
     const e = this.entry(ns);
     try {
       const idx = await this.exclusive(e, () => this.ensure(e, 'meta', true));
@@ -588,7 +683,7 @@ export class VectorStore {
     if (ns !== undefined) return this.usageOne(ns);
     const names = new Set<string>();
     for (const n of (await this.d.namespaces?.()) ?? [])
-      if (n.startsWith(VEC_NS_PREFIX)) names.add(n.slice(VEC_NS_PREFIX.length));
+      if (n.startsWith(this.prefix)) names.add(n.slice(this.prefix.length));
     for (const e of this.entries.values()) if (e.idx !== undefined) names.add(e.ns);
     let rows = 0;
     let bytes = 0;
@@ -602,6 +697,13 @@ export class VectorStore {
       }
     }
     return any ? { rows, bytes } : undefined;
+  }
+
+  /** Namespaces this store has a resident index for. */
+  protected openNamespaces(): string[] {
+    const out: string[] = [];
+    for (const e of this.entries.values()) if (e.idx !== undefined) out.push(e.ns);
+    return out;
   }
 
   /** Bytes the vector indexes this store has resident hold on the driver (for the soft quota). */

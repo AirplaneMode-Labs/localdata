@@ -19,6 +19,7 @@ import {
   type Kernel,
 } from './kernel';
 import {
+  HEAD_MAX_BYTES,
   META_PART_BYTES,
   VAL_PART_BYTES,
   corrupt,
@@ -30,8 +31,7 @@ import {
   type VecFiles,
 } from './files';
 
-/** A HEAD record longer than this is refused before parsing (64 + 32 * 4096 + 524288 + 4). */
-export const HEAD_MAX_BYTES = 64 + 32 * 4096 + 524_288 + 4;
+export { HEAD_MAX_BYTES };
 const VALUE_CACHE_PARTS = 16;
 const TEXT = new TextDecoder('utf-8', { ignoreBOM: true });
 

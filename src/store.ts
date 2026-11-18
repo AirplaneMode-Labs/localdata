@@ -3,9 +3,15 @@ import {
   STORAGE_KEY_MAX,
   STORAGE_NS_PATTERN,
   StorageError,
+  type ChunkHit,
+  type ChunkInput,
+  type DocumentInfo,
+  type DocumentInput,
   type ListOptions,
   type ListResult,
+  type PutDocumentResult,
   type PutVectorsResult,
+  type QueryChunksOptions,
   type QueryHit,
   type QueryOptions,
   type SetOptions,
@@ -19,7 +25,9 @@ import {
 } from './contracts/storage-api';
 import { META_NS } from './drivers/types';
 import { toStorageError } from './errors';
+import { nullRecord, setOwn } from './own';
 import { VectorStore } from './vec';
+import { DocStore, type PutProbe, type QueryProbe } from './docs/store';
 import type { KernelChoice } from './vec/kernel';
 import { DEFAULT_MAX_INDEX_BYTES } from './vec/files';
 import type { EventSink } from './contracts/event';
@@ -28,6 +36,8 @@ import {
   eventOptionProblem,
   outcomeOf,
   type DeleteOutcome,
+  type DocDeleteOutcome,
+  type DocPutOutcome,
   type GetOutcome,
   type SetOutcome,
 } from './events';
@@ -39,9 +49,10 @@ export interface LocalDataOptions {
   /** Injectable clock (epoch ms) used for TTL. Defaults to Date.now. */
   clock?: () => number;
   /**
-   * Optional sink for storage.set / get / delete / quota events (Event 0.1.2, source "localdata").
-   * Called synchronously inside try/catch and never awaited. Events never carry a key, a prefix or a
-   * value; the namespace does appear, so do not encode personal data in namespace names.
+   * Optional sink for the storage.* events (Event 0.1.4, source "localdata"). Called synchronously
+   * inside try/catch and never awaited. Events never carry a key, a prefix, a value, a docId, a title or
+   * chunk text; the namespace does appear (as prefix + '*' under a registered prefix, 'dockit.d' by
+   * default), so do not encode personal data in namespace names.
    */
   events?: EventSink;
   /** Session id stamped on events (1..64 chars): pass the runtime's sessionId() to share one id. */
@@ -109,6 +120,7 @@ export class LocalData implements StorageApi {
   private readonly clock: () => number;
   private readonly ev: StorageEvents;
   private readonly vec: VectorStore;
+  private readonly docs: DocStore;
   private readonly index = new Map<string, Map<string, IndexEntry>>();
   private closed = false;
 
@@ -119,6 +131,13 @@ export class LocalData implements StorageApi {
     this.clock = opts.clock ?? (() => Date.now());
     this.ev = new StorageEvents(opts.events, opts.driver.name, opts.eventSession);
     this.vec = new VectorStore({
+      driver: opts.driver,
+      events: this.ev,
+      kernel: opts.vectorKernel ?? 'auto',
+      maxIndexBytes: opts.maxIndexBytes ?? DEFAULT_MAX_INDEX_BYTES,
+      checkSoft: (ns, additional) => this.checkSoftQuota(ns, additional),
+    });
+    this.docs = new DocStore({
       driver: opts.driver,
       events: this.ev,
       kernel: opts.vectorKernel ?? 'auto',
@@ -217,8 +236,10 @@ export class LocalData implements StorageApi {
       await this.d.del(META_NS, ns);
       return;
     }
-    const rec: MetaRecord = { v: 1, k: {} };
-    for (const [key, e] of m) rec.k[key] = [e.size, e.expiresAt ?? 0];
+    // A null-prototype record filled with setOwn: the key '__proto__' is an ordinary member, so it is
+    // serialised like every other key instead of being swallowed by the prototype setter (S1-100).
+    const rec: MetaRecord = { v: 1, k: nullRecord<[number, number]>() };
+    for (const [key, e] of m) setOwn(rec.k, key, [e.size, e.expiresAt ?? 0]);
     const bytes = new TextEncoder().encode(JSON.stringify(rec));
     await this.d.put(META_NS, ns, bytes, { size: bytes.byteLength });
   }
@@ -229,9 +250,9 @@ export class LocalData implements StorageApi {
     return total;
   }
 
-  /** KV bytes plus the vector indexes this store has resident: what the soft quota is measured against. */
+  /** KV bytes plus the vector and document indexes this store has resident: what the soft quota is measured against. */
   private usedBytes(): number {
-    return this.totalBytes() + this.vec.residentBytes();
+    return this.totalBytes() + this.vec.residentBytes() + this.docs.residentBytes();
   }
 
   /** Throws quota_exceeded when `additionalBytes` more bytes of vector data would pass the soft quota. */
@@ -473,9 +494,103 @@ export class LocalData implements StorageApi {
     return this.vec.indexInfo(ns);
   }
 
-  /** @internal WebAssembly memory held by this store's vector kernel, in bytes (benchmarks, demo). */
+  /** @internal WebAssembly memory held by this store's kernels (vector index and documents), in bytes (benchmarks, demo). */
   vectorWasmBytes(): number {
-    return this.vec.wasmMemoryBytes();
+    return this.vec.wasmMemoryBytes() + this.docs.wasmMemoryBytes();
+  }
+
+  /** @internal The scan kernel the documents index uses, or 'none' before one exists (benchmarks, demo). */
+  documentsKernel(): string {
+    return this.docs.kernelInUse() ?? 'none';
+  }
+
+  // ----- documents (Storage API 0.3.0) -------------------------------------------------------
+
+  async putDocument(
+    ns: string,
+    doc: DocumentInput,
+    chunks: Iterable<ChunkInput> | AsyncIterable<ChunkInput>,
+  ): Promise<PutDocumentResult> {
+    const t0 = this.ev.start();
+    const probe: PutProbe = { chunks: 0, replaced: false, rows: 0, bytes: undefined };
+    let outcome: DocPutOutcome = 'ok';
+    try {
+      this.ensureOpen();
+      validateNamespace(ns);
+      return await this.docs.put(ns, doc, chunks, this.clock, probe);
+    } catch (e) {
+      outcome = outcomeOf(e);
+      throw e;
+    } finally {
+      this.ev.docPut(t0, ns, outcome, probe.chunks, probe.replaced, probe.rows, probe.bytes);
+    }
+  }
+
+  async getDocument(ns: string, docId: string): Promise<DocumentInfo | undefined> {
+    this.ensureOpen();
+    validateNamespace(ns);
+    return this.docs.get(ns, docId);
+  }
+
+  async listDocuments(ns: string): Promise<DocumentInfo[]> {
+    this.ensureOpen();
+    validateNamespace(ns);
+    return this.docs.list(ns);
+  }
+
+  async deleteDocument(ns: string, docId: string): Promise<boolean> {
+    const t0 = this.ev.start();
+    let outcome: DocDeleteOutcome = 'absent';
+    try {
+      this.ensureOpen();
+      validateNamespace(ns);
+      const removed = await this.docs.remove(ns, docId);
+      outcome = removed ? 'removed' : 'absent';
+      return removed;
+    } catch (e) {
+      outcome = outcomeOf(e);
+      throw e;
+    } finally {
+      this.ev.docDelete(t0, ns, outcome);
+    }
+  }
+
+  async queryChunks(
+    ns: string,
+    vector: Float32Array,
+    k: number,
+    opts?: QueryChunksOptions,
+  ): Promise<ChunkHit[]> {
+    const t0 = this.ev.start();
+    const probe: QueryProbe = { candidates: 0, metric: 'cosine' };
+    let outcome = 'ok';
+    try {
+      this.ensureOpen();
+      validateNamespace(ns);
+      return await this.docs.queryChunks(ns, vector, k, opts, probe);
+    } catch (e) {
+      outcome = outcomeOf(e);
+      throw e;
+    } finally {
+      this.ev.docQuery(
+        t0,
+        ns,
+        outcome,
+        k,
+        probe.candidates,
+        probe.metric,
+        this.docs.kernelInUse() ?? 'none',
+      );
+    }
+  }
+
+  /**
+   * Events only: a namespace that starts with `prefix` is emitted in event attrs as prefix + '*', so an
+   * application that keeps one namespace per document never shows a docId in an event. The SDK itself
+   * registers 'dockit.d'.
+   */
+  redactNamespacePrefix(prefix: string): void {
+    this.ev.redact(prefix);
   }
 
   /** @internal Test hook: the n-th next kernel call (0 = next) traps for real. */
@@ -510,6 +625,11 @@ export class LocalData implements StorageApi {
       out.vectorRows = vec.rows;
       out.vectorBytes = vec.bytes;
     }
+    const docs = await this.docs.docUsage(ns);
+    if (docs !== undefined) {
+      out.bytes += docs.bytes;
+      out.documents = docs.documents;
+    }
     if (this.quotaBytes !== undefined) out.quotaBytes = this.quotaBytes;
     if (!nested) this.ev.quota(ns ?? '', out.bytes, this.quotaBytes ?? null, 0, 'debug');
     return out;
@@ -526,6 +646,7 @@ export class LocalData implements StorageApi {
       throw toStorageError(e, 'clear');
     }
     await this.vec.clear(ns);
+    await this.docs.clear(ns);
   }
 
   async list(ns: string, opts?: ListOptions): Promise<ListResult> {
@@ -555,6 +676,7 @@ export class LocalData implements StorageApi {
     if (this.closed) return;
     this.closed = true;
     this.vec.close();
+    this.docs.close();
     try {
       await this.d.close();
     } catch (e) {

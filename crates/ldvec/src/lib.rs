@@ -1,7 +1,7 @@
 //! ldvec: the flat-index kernel behind @airplanemode/localdata.
 //!
 //! * [`crc32c`]: CRC-32C (Castagnoli), slicing-by-8, incremental.
-//! * [`format`]: validation of the on-disk HEAD record and META blob (docs/vector-index-format.md).
+//! * [`mod@format`]: validation of the on-disk HEAD record and META blob (docs/vector-index-format.md).
 //! * [`scan`]: row checks, inverse norms and the bit-exact scan, SIMD or scalar from one source.
 //!
 //! The WASM module exposes raw `extern "C"` functions (no wasm-bindgen): pointers and lengths are
@@ -141,7 +141,7 @@ pub extern "C" fn ldv_check_rows(vec_ptr: u32, rows: u32, dim: u32) -> i32 {
     scan::check_rows(v, rows as usize, dim as usize)
 }
 
-/// Writes 1/||row|| (0 for a zero row) for each of `rows` rows into `out_ptr` (f32[rows]).
+/// Writes 1/||row|| (0 for a zero row) for each of `rows` rows into `out_ptr` (`f32[rows]`).
 /// Returns 0, or -100 for an argument error.
 #[no_mangle]
 pub extern "C" fn ldv_inv_norms(vec_ptr: u32, rows: u32, dim: u32, out_ptr: u32) -> i32 {
@@ -159,8 +159,8 @@ pub extern "C" fn ldv_inv_norms(vec_ptr: u32, rows: u32, dim: u32, out_ptr: u32)
     0
 }
 
-/// Scores `rows` rows at `vec_ptr` against the query at `q_ptr` (f32[dim]) into `out_ptr`
-/// (f32[rows]). `norms_ptr` is f32[rows] (read for cosine only; may be 0 for dot). `metric` 0 is
+/// Scores `rows` rows at `vec_ptr` against the query at `q_ptr` (`f32[dim]`) into `out_ptr`
+/// (`f32[rows]`). `norms_ptr` is `f32[rows]` (read for cosine only; may be 0 for dot). `metric` 0 is
 /// cosine, 1 is dot. Returns 0, or -100 for an argument error.
 #[no_mangle]
 pub extern "C" fn ldv_scan(

@@ -6,6 +6,7 @@
 // Date -> {"$ld":"date","v": ms | null}; non-finite or negative-zero numbers -> {"$ld":"num","v": tag};
 // a plain object that owns a "$ld" key is escaped as {"$ld":"obj","o": { ...entries }}.
 import { StorageError, type StorableValue } from './contracts/storage-api';
+import { setOwn } from './own';
 
 export const MAGIC: Uint8Array = Uint8Array.from([0x4c, 0x44, 0x31]); // 'LD1'
 const HEADER = 8;
@@ -134,8 +135,9 @@ export async function encode(value: StorableValue): Promise<Uint8Array> {
       if (!isPlainObject(obj))
         throw invalid(`class instance (${obj.constructor?.name ?? 'unknown'})`, path);
       const rec = obj as Record<string, unknown>;
+      // setOwn, never `out[k] =`: a key '__proto__' must become an own member (S1-101).
       const out: Record<string, unknown> = {};
-      for (const k of Object.keys(rec)) out[k] = walk(rec[k], `${path}.${k}`);
+      for (const k of Object.keys(rec)) setOwn(out, k, walk(rec[k], `${path}.${k}`));
       return Object.prototype.hasOwnProperty.call(rec, '$ld') ? { $ld: 'obj', o: out } : out;
     } finally {
       seen.delete(obj);
@@ -204,8 +206,9 @@ export function decode(bytes: Uint8Array): StorableValue {
     const rec = node as Record<string, unknown>;
     const tag = rec['$ld'];
     if (typeof tag !== 'string') {
+      // setOwn: stored bytes may name '__proto__'; it is data, never a prototype (S1-101).
       const out: Record<string, StorableValue> = {};
-      for (const k of Object.keys(rec)) out[k] = revive(rec[k]);
+      for (const k of Object.keys(rec)) setOwn(out, k, revive(rec[k]));
       return out;
     }
     switch (tag) {
@@ -215,7 +218,7 @@ export function decode(bytes: Uint8Array): StorableValue {
           throw corrupt('bad obj escape');
         const out: Record<string, StorableValue> = {};
         for (const k of Object.keys(inner as object))
-          out[k] = revive((inner as Record<string, unknown>)[k]);
+          setOwn(out, k, revive((inner as Record<string, unknown>)[k]));
         return out;
       }
       case 'date':
