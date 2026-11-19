@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Copies the two contracts localdata vendors from the sibling runtime repository (../runtime/spec)
-// into src/contracts/, prepending the vendoring header: storage-api.ts @ 0.3.0 and event.ts @ 0.1.4.
+// into src/contracts/, prepending the vendoring header: storage-api.ts @ 0.4.0 and event.ts @ 0.1.5.
 // The source of truth is runtime/spec; never edit a vendored copy by hand.
 //
 // The copy is gated on the spec release's SPEC-LANDED.txt (one `sha256  path` line per spec file):
@@ -32,8 +32,8 @@ export const DEFAULT_OUT_DIR = resolve(repo, 'src', 'contracts');
 // Each contract carries its own version (spec release 0.5.0): the header names that contract's
 // version, not the release's.
 export const CONTRACT_VERSIONS = {
-  'storage-api.ts': '0.3.0',
-  'event.ts': '0.1.4',
+  'storage-api.ts': '0.4.0',
+  'event.ts': '0.1.5',
 };
 export const CONTRACT_FILES = Object.keys(CONTRACT_VERSIONS);
 

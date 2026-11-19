@@ -53,18 +53,18 @@ function fixture(): { specDir: string; outDir: string; landed: Map<string, strin
 }
 
 describe('vendored contracts', () => {
-  it('vendor storage-api.ts @ 0.3.0 and event.ts @ 0.1.4, each with its own version header', () => {
-    expect(CONTRACT_VERSIONS).toEqual({ 'storage-api.ts': '0.3.0', 'event.ts': '0.1.4' });
+  it('vendor storage-api.ts @ 0.4.0 and event.ts @ 0.1.5, each with its own version header', () => {
+    expect(CONTRACT_VERSIONS).toEqual({ 'storage-api.ts': '0.4.0', 'event.ts': '0.1.5' });
     expect(CONTRACTS.map((c: { target: string }) => c.target.split(/[\\/]/).pop())).toEqual([
       'storage-api.ts',
       'event.ts',
     ]);
     const headers = (CONTRACTS as Array<{ header: string }>).map((c) => c.header);
     expect(headers[0]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.3.0; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.4.0; source of truth is runtime/spec; do not edit here\n',
     );
     expect(headers[1]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.4; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.5; source of truth is runtime/spec; do not edit here\n',
     );
   });
 
@@ -124,11 +124,11 @@ describe('sync() gated on SPEC-LANDED.txt', () => {
     const first = sync({ specDir, outDir, landed });
     expect(first.map((r: { status: string }) => r.status)).toEqual(['updated', 'updated']);
     expect(readFileSync(join(outDir, 'storage-api.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.3.0; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.4.0; source of truth is runtime/spec; do not edit here\n' +
         STORAGE_SRC,
     );
     expect(readFileSync(join(outDir, 'event.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.4; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.5; source of truth is runtime/spec; do not edit here\n' +
         EVENT_SRC,
     );
     const second = sync({ specDir, outDir, landed });
