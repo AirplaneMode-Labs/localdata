@@ -1,0 +1,22 @@
+export const DELETE_COST_COLUMNS: string[];
+export const EIGHT_GB: string;
+export const DELETE_COST_CSV: string;
+export function deleteCostHeader(): string;
+export function deleteCostRow(o: Record<string, string | number | boolean>): string;
+export function parseCsv(text: string): Array<Record<string, string>>;
+export function deleteCostPhrases(rows: Array<Record<string, string>>): {
+  graph100k: number;
+  flat100k: number;
+  graph20k: number;
+  flat20k: number;
+  large: string;
+  small: string;
+  million: string;
+  machine: string;
+  os: string;
+  chrome: string;
+  commit: string;
+  command: string;
+  deletes: string;
+  runs: number;
+};
