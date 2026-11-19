@@ -1,6 +1,7 @@
 # Vector index on-disk format, version 1
 
-Status: implemented in `0.2.0-alpha.0` (Sprint 4); unchanged in `0.3.0-alpha.0` (Sprint 5), which adds the
+Status: implemented in `0.2.0-alpha.0` (Sprint 4); unchanged in `0.3.0-alpha.0` (Sprint 5) and `0.4.0-alpha.0` (Sprint 6; the HNSW graph is a separate record pair,
+[hnsw-format.md](hnsw-format.md), and no byte of this format changed), which adds the
 documents layout of section 8 on top of this very format (no byte of HEAD, META or a part changed, so
 `formatVersion` stays 1 and no old file needs a new reader). This format is **localdata-internal**: Storage API
 0.3.0 promises only the behaviour in `runtime/spec/storage-api.md`, never these bytes. It is documented

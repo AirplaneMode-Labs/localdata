@@ -7,6 +7,130 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0-alpha.0] - 2026-11-19 (untagged)
+
+Sprint 6 (D4). Ids: `D4-0x` are Sprint 6 items; `S1-1xx` are security-consultant findings; `TD-xx` are team
+decisions under owner delegation (TD-65 HNSW build or adopt, TD-69 versions, TD-76 the benchmark CSV).
+Storage API 0.4.0 and Event 0.1.5 are vendored from spec release 0.6.0 in runtime/spec. No dependency was
+added: `crates/ldvec/Cargo.toml` still has an empty `[dependencies]` and `NOTICE` is unchanged. Nothing is
+tagged or published.
+
+### Added
+
+- HNSW behind the Storage API (0.4.0): `buildIndex(ns, { kind: 'hnsw', metric?, m?, efConstruction?, seed? })`,
+  `dropIndex(ns, 'hnsw')`, `query(..., { index: 'hnsw', ef })`, `VectorIndexInfo.ann` and
+  `UsageResult.annBytes`. Flat stays the default and the fallback: a request for HNSW that cannot be answered
+  by a current, valid graph is answered by the flat scan, with the same results, and the reason is in the
+  event (`absent`, `stale`, `filter`, `metric`, `refused`, `trap`). The graph lives in the reserved driver
+  namespace `__ld_ann.<ns>` (a `graph` and a `params` record), works on the OPFS, IndexedDB and memory
+  drivers, and holds no vectors and no keys. (D4-03, D4-04, TD-65)
+- The HNSW kernel in `ldvec` (`crates/ldvec/src/hnsw.rs`, format `LDHNSW01` in `docs/hnsw-format.md`):
+  deterministic build (integer-only levels, `f32::total_cmp` ties, no hash map or thread), search with the
+  flat scan's own scoring function, insert, delete marks, serialise and a validator that refuses every
+  truncation, flipped byte, out-of-range or self link, level above 16, over-large declared count, other
+  namespace (bound by its bytes, not a checksum), other dimension and a graph from the future, with no panic
+  (10,000 seeded mutations) and `try_reserve` for every allocation sized from a file field. FFI in the
+  existing raw style with integer handles. (D4-03)
+- Tests, written before the code: recall@10 against the flat scan on the fixed 10,000 x 384 clustered set
+  (floor 0.95, stated before measuring, in Rust and through the store), graph bytes identical for the same
+  seed and order and equal to `test/fixtures/hnsw-determinism.json` on native and WebAssembly (SIMD and scalar),
+  persist and cold reload, delete and re-insert, a forged graph linking to a deleted row, a graph ahead of
+  HEAD, truncated, flipped, other-namespace and other-dimension graphs refused and rebuilt to the same bytes
+  as a fresh build, a rebuild refused again dropping to flat with no loop, refused params, a kernel trap,
+  quota (`buildIndex` over quota writes nothing), the reserved prefix, all in Vitest and in Chrome on OPFS
+  and IndexedDB. (D4-03, D4-04)
+- `npm run bench:ann` (`bench/ann-bench.spec.ts`): flat and HNSW at 100,000 x 384 (clustered and uniform) on
+  OPFS, build time, query p50 and p95, recall@10, index and graph bytes, JS heap and WebAssembly memory,
+  written to `docs/benchmarks/ann.csv` with machine, command and "not measured on 8 GB" on every row; `npm run
+  bench:ann-readme` writes the README block from the CSV and nothing else (`test/readme-ann-bench.test.ts`).
+  The integer-only clustered generator is implemented identically in `bench/synth.ts` and
+  `crates/ldvec/tests/support/synth.rs`. (D4-05, TD-76)
+- `npm run bench:delete-cost` (`bench/delete-cost.ts`, fix round 2): what one `delete()` costs with and without a
+  current graph at 20,000 x 32 and 100,000 x 32, in installed Chrome on OPFS, written to
+  `docs/benchmarks/delete-cost.csv` with machine, command and "not measured on 8 GB" on every row;
+  `test/readme-delete-cost.test.ts` demands that the README and `docs/vector-index.md` quote exactly the CSV's
+  figures. (BUG-T2-S6-13)
+- The demo's "Flat or HNSW" section: an index-kind switch over seeded data with the measured recall, the graph
+  bytes, and a button that truncates the demo's own graph record to show the refusal and the rebuild. (D4-06)
+- Events (Event 0.1.5): `storage.index.build`; `requested`, `index`, `fallback` and `ef` on `storage.query`;
+  `kind` and, for a refused graph, a `reason` on `storage.index.open`. None carries a key, a vector, a score
+  or the seed. (D4-04)
+
+### Changed
+
+- Vendored `src/contracts/storage-api.ts` @ 0.4.0 and `event.ts` @ 0.1.5 (spec release 0.6.0);
+  `STORAGE_EVENT_NAMES` has eleven names. The tests that pinned ten names and the contract versions were
+  updated with them. (D4-02)
+- The README follows the Sprint 6 section order (Status, Install, Quick start, How it works, Contracts, Demo,
+  Benchmarks, Limitations, Security and privacy, Develop, Licence). (D4-07)
+- `usage()` counts the graph (`annBytes`, included in `bytes`), and graph bytes count toward the pre-write quota
+  checks, so a namespace with a graph can refuse a `putVectors` that a flat-only namespace accepts. Flat-only
+  quota behaviour is unchanged. (D4-04)
+- BUG-T2-S6-04 (documentation only): the README Limitations and `docs/vector-index.md` no longer advise "batch
+  them" for deletes. With a current graph every `delete` rewrites the whole graph record and there is no batched
+  delete (deferred to Sprint 7); the per-delete cost is quoted from `docs/benchmarks/delete-cost.csv` (see
+  BUG-T2-S6-13 below). The bulk-delete workaround is `dropIndex`, delete, `buildIndex`. Both documents
+  also state the identical-vector limit and the 64-graph cap.
+- BUG-T2-S6-11 (documentation and a test, no API change): the README Limitations and `docs/vector-index.md` say
+  that a graph keeps the nodes of replaced rows, so after most rows are replaced, or after building over
+  duplicate-heavy data (boilerplate chunks), recall can fall below a fresh build's with no signal in a query;
+  `indexInfo(ns).ann` (`nodes`, `liveNodes`) shows it and the caller should call `buildIndex` again when
+  `liveNodes / nodes` is 0.5 or lower. Compaction stays not built. `test/ann-churn.test.ts` reproduces the
+  condition on a small seeded set and shows `buildIndex` restoring recall@10 to 1.0; no figure for the degraded
+  recall is quoted.
+- BUG-T2-S6-13 (documentation and a bench): the per-delete cost in the README and `docs/vector-index.md` no longer
+  comes from an internal log; it is computed from the committed `docs/benchmarks/delete-cost.csv`
+  (22.80 ms per delete with a current graph against 2.60 ms flat-only at 100,000 x 32, Apple M5 Pro, OPFS, not
+  measured on 8 GB). Neither document refers to an evidence folder for a figure.
+- Re-vendored `src/contracts/storage-api.ts` @ 0.4.0 and `event.ts` @ 0.1.5 from the re-landed spec release 0.6.0
+  (fix round 1): `HNSW_MAX_GRAPHS`, the `storage.query` fallback `short` and the `max_graphs` reason. Versions
+  are unchanged.
+- Cargo: `[profile.test] opt-level = 3`, so the HNSW tests (a 10,000 x 384 build, a 10,000-mutation fuzz) run
+  in seconds. Release profile unchanged.
+
+### Fixed
+
+- S1-120: the event privacy test's needle `c0de` is made only of characters a random UUID can contain and
+  failed about once in a few hundred runs; every needle now has a character outside `[0-9a-f-]`, with a test
+  that shows the old needle collided and a 10,000-run seeded check of 0 false hits. (D4-01)
+- BUG-T2-S6-02: with many identical vectors (repeated boilerplate chunks) a graph query returned fewer than `k`
+  hits (34 for `k` = 50 with 60, 200 or 1,000 copies) and the event said the graph had answered. A graph answer
+  with fewer live hits than min(`k`, live rows) is now discarded and the exact flat scan answers, with the
+  `storage.query` event reporting `index: 'flat'` and `fallback: 'short'` (a `k` above 1,000, which the graph
+  can never fill, is answered the same way). The kernel, the graph bytes and the determinism fixture are
+  unchanged; the count over the 100,000 x 384 benchmark query sets (clustered and uniform, ef 32, 64, 128) is 0
+  `short` fallbacks, so `docs/benchmarks/ann.csv` is unchanged. The kernel root cause is Sprint 7.
+- BUG-T2-S6-03: the 65th `buildIndex` in one store (the kernel's handle table holds 64 graphs, `HNSW_MAX_GRAPHS`)
+  threw `quota_exceeded` with `reason: 'wasm_memory'`; it now throws `reason: 'max_graphs'` and writes nothing.
+  `dropIndex` of one namespace frees a slot, and rebuilding a namespace whose graph is already loaded replaces it
+  at the cap. (A query that had to load a 65th persisted graph threw the same error in this round; fix round 2,
+  BUG-T2-S6-08 below, replaced that with least-recently-used eviction.) No kernel or graph-format change: the SDK
+  counts the live handles on the failure path only.
+- BUG-T2-S6-08 (fix round 2): a query with `index: 'hnsw'` threw `quota_exceeded` with `reason: 'max_graphs'` when a
+  store whose driver held more than 64 persisted graphs had to load another one. Only `buildIndex` is capped now
+  (its behaviour is unchanged): a load into a full handle table releases the least-recently-used resident
+  graph of an idle namespace and loads again, never one whose namespace has an operation running or queued.
+  The released graph's stored record is neither deleted nor rewritten. When every resident graph is in use the
+  query is answered by the exact flat scan with `fallback: 'absent'` and the stored graph is left alone; a put
+  or delete in that situation no longer throws either. No spec change, no kernel or graph-format change.
+- BUG-T2-S6-07: `armAnnTrapForTest` was a public method of `LocalData` and is gone from the class, the typings and
+  the bundle. The test hook is `armAnnTrap(store)` in `src/vec/ann-test-hook.ts`, a module nothing shipped
+  imports; `test/dist-surface.test.ts` and `npm run pack:check` fail if a hook reaches `dist/`.
+- BUG-T3-S6-08: the `ldvec` crate manifest described a flat-only 300-line kernel; its description and comment now
+  cover the flat scan plus the in-house HNSW graph (about 1,050 lines in `src/hnsw.rs`) and give TD-17 and TD-65
+  as the reason for zero dependencies. `[dependencies]` is still empty; `Cargo.lock` and `NOTICE` are unchanged.
+
+### Security
+
+- BUG-T2-S6-12: `annStatsForTest` and `armVectorTrapForTest` (the latter made the flat kernel trap on demand for any
+  holder of a store) are gone from `LocalData`, the typings and the bundle, with the internal `*ForTest` methods
+  behind them; the hooks are `annStats`, `armVectorTrap` and `armAnnTrap` in `src/vec/ann-test-hook.ts`, which nothing
+  shipped imports, and `test/dist-surface.test.ts` and `npm run pack:check` fail on any `*ForTest` name or hook
+  function name in `dist/`.
+- The graph file is untrusted input and is refused, never trusted, on any failed check; a crafted graph can only
+  lower recall because hits are scored from the stored vectors and liveness comes from the flat HEAD.
+- No dependency added; the kernel's `[dependencies]` section is empty.
+
 ## [0.3.0-alpha.0] - 2026-11-18 (untagged)
 
 Sprint 5 (D4). Ids: `D4-0x` are Sprint 5 items; `S1-0xx` and `S1-1xx` are security-consultant findings;
