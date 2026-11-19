@@ -82,11 +82,37 @@ const indexMb = String(Math.round(sizes[sizes.length >> 1] / 1e6));
 if (!/^[0-9]{1,5}$/.test(indexMb)) throw new Error(`implausible index size ${indexMb}`);
 if (!html.includes('__INDEX_MB__'))
   throw new Error('demo/index.html lost its __INDEX_MB__ placeholder');
+// The HNSW section's storage warning comes from the HNSW benchmark CSV the same way: the median flat index
+// bytes plus the median graph bytes of the clustered 100,000-row runs, scaled to the demo's 20,000 rows and
+// rounded up to a whole number of MB. A missing figure fails the build.
+const ann = parseCsv(
+  readFileSync(join(here, '..', 'docs', 'benchmarks', 'ann.csv'), 'utf8'),
+).filter((r) => r.data === 'clustered' && r.rows === '100000');
+const med = (xs) => {
+  const s2 = [...xs].sort((a, b) => a - b);
+  return s2[s2.length >> 1];
+};
+const annFlat = ann.filter((r) => r.index_kind === 'flat').map((r) => Number(r.index_bytes));
+const annGraph = ann.filter((r) => r.index_kind === 'hnsw').map((r) => Number(r.ann_bytes));
+if (
+  annFlat.length === 0 ||
+  annGraph.length === 0 ||
+  ![...annFlat, ...annGraph].every(Number.isFinite)
+) {
+  throw new Error('docs/benchmarks/ann.csv has no clustered 100,000-row flat and hnsw rows');
+}
+const annMb = String(Math.ceil(((med(annFlat) + med(annGraph)) * 20_000) / 100_000 / 1e6));
+if (!/^[0-9]{1,5}$/.test(annMb)) throw new Error(`implausible HNSW demo size ${annMb}`);
+if (!html.includes('__ANN_MB__'))
+  throw new Error('demo/index.html lost its __ANN_MB__ placeholder');
 // The id goes into a data attribute (letters, hex, spaces and a hyphen only); demo/app.ts checks it against a
 // fixed pattern and renders it with textContent.
 writeFileSync(
   join(outDir, 'index.html'),
-  html.replace('__BUILD_ID__', buildLabel).replaceAll('__INDEX_MB__', indexMb),
+  html
+    .replace('__BUILD_ID__', buildLabel)
+    .replaceAll('__INDEX_MB__', indexMb)
+    .replaceAll('__ANN_MB__', annMb),
 );
 copyFileSync(join(here, 'styles.css'), join(outDir, 'styles.css'));
 writeFileSync(join(outDir, 'build.json'), `${JSON.stringify({ sha, id: buildLabel })}\n`);

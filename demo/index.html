@@ -19,7 +19,7 @@
         page's own files.
       </p>
       <!-- prettier-ignore -->
-      <p class="status-line" id="sprint-status">Sprint 5 (18 Nov 2026): Working: a documents API (putDocument, queryChunks returning chunk text and source page, deleteDocument; all-or-nothing, with clear(ns) removing a document namespace physically), prototype-safe keys and values, size-checked OPFS reads, a sweep of unreferenced records on open, all on OPFS, IndexedDB and memory in Chrome on an Apple M5 Pro with 48 GB (not measured on 8 GB). Not yet: HNSW, quantisation, compaction, encryption at rest, an 8 GB measurement.</p>
+      <p class="status-line" id="sprint-status">Sprint 6 (19 Nov 2026): Working: an optional HNSW graph behind the Storage API (buildIndex, query with index "hnsw" and ef; flat stays the default and the fallback; the graph is stored on OPFS, IndexedDB or memory, validated on every read and rebuilt from the stored vectors when it is refused), built in-house in the Rust ldvec crate with no new dependency and shown here against the flat scan on the same seeded data, in Chrome on an Apple M5 Pro with 48 GB (not measured on 8 GB). Not yet: quantisation, compaction, encryption at rest, HNSW for queryChunks, an 8 GB measurement.</p>
       <p class="status-line" id="build-line">
         <code id="build-sha" data-build="__BUILD_ID__">Local build local</code>
       </p>
@@ -57,8 +57,9 @@
         <h2>What this demo does not do yet</h2>
         <ul>
           <li>
-            Not yet: HNSW (Sprint 6, after the TD-17 note), quantisation, compaction, encryption at
-            rest, and a measurement on an 8 GB laptop (not measured on 8 GB).
+            Not yet: quantisation, compaction, encryption at rest, HNSW for
+            <code>queryChunks</code> (the documents API stays a flat scan), and a measurement on an
+            8 GB laptop (not measured on 8 GB).
           </li>
           <li>
             There is no compaction: deleting a document hides its chunks from every query but the
@@ -66,9 +67,11 @@
             this origin, and anyone with this browser profile, can read what is stored.
           </li>
           <li>
-            The vector index and the documents are flat scans: every query scores every row. The
-            figures on this page are measured in this tab on this device; the README figures are
-            from an Apple M5 Pro 48 GB and nothing here is an 8 GB figure.
+            The vector index is a flat scan unless a query asks for HNSW, and the documents are
+            always a flat scan. HNSW is approximate: it can miss rows, and the page shows how many
+            for its own 20,000 rows. The figures on this page are measured in this tab on this
+            device; the README figures are from an Apple M5 Pro 48 GB and nothing here is an 8 GB
+            figure.
           </li>
           <li>
             The documents on this page are three synthetic, made-up documents with seeded vectors.
@@ -240,6 +243,61 @@
         <ol id="vec-hits" class="events" aria-live="polite"></ol>
         <!-- prettier-ignore -->
         <p class="muted">Measured in this tab on this device. The README figure is from an Apple M5 Pro 48 GB; not measured on 8 GB.</p>
+      </section>
+
+      <section id="ann" class="box">
+        <h2>Flat or HNSW, on the same seeded data</h2>
+        <!-- prettier-ignore -->
+        <p>A seeded clustered set of 20,000 rows of dimension 384 (the integer-only generator of bench/synth.ts, the same bytes in Rust and TypeScript; no real documents and no model), written with <code>putVectors</code> into the namespace <code>demo-ann</code>, then indexed with <code>buildIndex</code> (HNSW, m 16, efConstruction 200, seed 1). The switch flips <code>query()</code> between <code>index: 'flat'</code> and <code>index: 'hnsw'</code> over 50 seeded queries; for HNSW the page also runs the flat scan afterwards to count how many of the exact top 10 the graph found.</p>
+        <p id="ann-warning" class="muted">
+          This set uses about <span id="ann-mb">__ANN_MB__</span> MB of this browser's storage
+          (shared with other Airplane Mode Labs demos on this origin); Delete index removes it.
+        </p>
+        <div class="row">
+          <button id="ann-build" type="button">Build (20,000 rows and the graph)</button>
+          <label for="ann-kind">Index kind</label>
+          <select id="ann-kind">
+            <option value="flat">flat</option>
+            <option value="hnsw" selected>hnsw</option>
+          </select>
+          <button id="ann-run" type="button">Run 50 queries</button>
+        </div>
+        <div class="row">
+          <button id="ann-corrupt" type="button">Corrupt the graph</button>
+          <button id="ann-reload" type="button">Reload page</button>
+          <button id="ann-delete" type="button">Delete index</button>
+        </div>
+        <p id="ann-status" class="mono" aria-live="polite"></p>
+        <table class="kv-table" id="ann-facts" hidden>
+          <tbody>
+            <tr>
+              <th scope="row">Index kind asked for, answered by</th>
+              <td id="ann-which">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Build: flat write, graph</th>
+              <td id="ann-build-time">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Query time over 50 queries (p50, p95)</th>
+              <td id="ann-time">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Recall@10 against the flat scan (50 queries)</th>
+              <td id="ann-recall">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Graph bytes (annBytes), flat index bytes</th>
+              <td id="ann-bytes">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Graph events</th>
+              <td id="ann-events">-</td>
+            </tr>
+          </tbody>
+        </table>
+        <!-- prettier-ignore -->
+        <p class="muted">Corrupt the graph truncates the graph record of the namespace demo-ann only (never the vectors); the next HNSW query refuses it, rebuilds it from the stored vectors and answers, and the events line shows both. Measured in this tab on this device; the README figures are from an Apple M5 Pro 48 GB; not measured on 8 GB.</p>
       </section>
 
       <section id="documents" class="box">

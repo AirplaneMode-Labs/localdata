@@ -2,16 +2,22 @@
 // exercises the SDK's set/get/delete/list/usage surface against the OPFS, IndexedDB and memory
 // drivers, lists the storage.* events the SDK emits to an EventSink, shows
 // navigator.storage.estimate() and persist(), builds and queries a flat vector index of synthetic rows
-// (namespace demo-vectors) with a cold-query measurement and a check against the naive reference, stores
+// (namespace demo-vectors) with a cold-query measurement and a check against the naive reference, flips
+// query() between the flat scan and an HNSW graph over the same seeded clustered rows (namespace demo-ann)
+// and shows build time, query time, recall@10 against flat, the graph bytes and, after a deliberate
+// truncation of the graph record of that namespace only, the refusal and the rebuild, stores
 // three synthetic documents with the documents API (namespace demo-docs: put, query with chunk text and
 // source pages, delete one, reload, clear), and fills quota with synthetic data under the namespace
 // demo-fill.
 // It makes no network request and touches no storage outside localdata's own OPFS directory and
 // IndexedDB database (airplanemode-localdata).
 import {
+  ANN_NS_PREFIX,
   createStore,
   indexedDbAvailable,
+  IndexedDbDriver,
   opfsAvailable,
+  OpfsDriver,
   STORAGE_EVENT_NAMES,
   STORAGE_ROOT,
   StorageError,
@@ -21,7 +27,16 @@ import {
   type StorableValue,
 } from '../src/index.ts';
 import { topKRef } from '../src/vec/reference.ts';
-import { DIM, synthKey, synthQuery, synthRows, synthVector } from '../bench/synth.ts';
+import {
+  ClusteredStream,
+  DIM,
+  clusteredCentres,
+  clusteredPoints,
+  synthKey,
+  synthQuery,
+  synthRows,
+  synthVector,
+} from '../bench/synth.ts';
 
 type DriverName = 'opfs' | 'indexeddb' | 'memory';
 
@@ -83,6 +98,20 @@ const ui = {
   vecBytes: el<HTMLTableCellElement>('vec-bytes'),
   vecMatch: el<HTMLTableCellElement>('vec-match'),
   vecHits: el<HTMLOListElement>('vec-hits'),
+  annBuild: el<HTMLButtonElement>('ann-build'),
+  annKind: el<HTMLSelectElement>('ann-kind'),
+  annRun: el<HTMLButtonElement>('ann-run'),
+  annCorrupt: el<HTMLButtonElement>('ann-corrupt'),
+  annReload: el<HTMLButtonElement>('ann-reload'),
+  annDelete: el<HTMLButtonElement>('ann-delete'),
+  annStatus: el<HTMLParagraphElement>('ann-status'),
+  annFacts: el<HTMLTableElement>('ann-facts'),
+  annWhich: el<HTMLTableCellElement>('ann-which'),
+  annBuildTime: el<HTMLTableCellElement>('ann-build-time'),
+  annTime: el<HTMLTableCellElement>('ann-time'),
+  annRecall: el<HTMLTableCellElement>('ann-recall'),
+  annBytes: el<HTMLTableCellElement>('ann-bytes'),
+  annEvents: el<HTMLTableCellElement>('ann-events'),
   docPut: el<HTMLButtonElement>('doc-put'),
   docTarget: el<HTMLSelectElement>('doc-target'),
   docQuery: el<HTMLButtonElement>('doc-query'),
@@ -614,6 +643,230 @@ function wireVectors(): void {
   }
 }
 
+// ----- flat or HNSW (Storage API 0.4.0) -------------------------------------------------------
+
+// Its own store (driver 'auto'), closed after every action so Reload page followed by Run 50 queries is a
+// genuinely cold open. The rows and the queries are the integer-only clustered set of bench/synth.ts (the
+// same bytes in Rust and TypeScript): 20,000 x 384 around 200 centres, 50 queries from the same mixture.
+// The switch is the `index` option of query(). For 'hnsw' the flat scan of the same store runs AFTER the
+// timings, to count how many of the exact top 10 the graph found. Corrupt the graph rewrites the graph
+// record of the namespace demo-ann only (to half its length); the next HNSW query shows the SDK refusing
+// it and rebuilding it from the stored vectors.
+
+const ANN_NS = 'demo-ann';
+const ANN_ROWS = 20_000;
+const ANN_CENTRES = 200;
+const ANN_SEED = 20_000;
+const ANN_QUERIES = 50;
+let annBusy = false;
+const annBuildFacts = { flatMs: 0, graphMs: 0, built: false };
+
+function annSetBusy(busy: boolean): void {
+  annBusy = busy;
+  for (const b of [ui.annBuild, ui.annRun, ui.annCorrupt, ui.annReload, ui.annDelete])
+    b.disabled = busy;
+  ui.annKind.disabled = busy;
+}
+
+async function annRunGuarded(action: () => Promise<void>): Promise<void> {
+  if (annBusy) return;
+  annSetBusy(true);
+  try {
+    await action();
+  } catch (e) {
+    ui.annStatus.textContent = `[${stamp()}] ${showError(e)}`;
+  } finally {
+    annSetBusy(false);
+    void refreshStoragePanel();
+  }
+}
+
+/** The page's sink for this section: the shared event list, plus a private copy of what one action emitted. */
+function annSink(into: Event[]): EventSink {
+  return {
+    emit(e: Event): void {
+      into.push(e);
+      eventSink.emit(e);
+    },
+  };
+}
+
+function annQueries(): Float32Array[] {
+  const flat = clusteredPoints(
+    clusteredCentres(ANN_SEED, ANN_CENTRES, DIM),
+    DIM,
+    ANN_SEED,
+    'query',
+    ANN_QUERIES,
+  );
+  return Array.from({ length: ANN_QUERIES }, (_, j) => flat.slice(j * DIM, (j + 1) * DIM));
+}
+
+function* annRows(): Generator<{ key: string; vector: Float32Array }> {
+  const stream = new ClusteredStream(
+    clusteredCentres(ANN_SEED, ANN_CENTRES, DIM),
+    DIM,
+    ANN_SEED,
+    'data',
+  );
+  for (let i = 0; i < ANN_ROWS; i++) {
+    const vector = new Float32Array(DIM);
+    stream.nextInto(vector);
+    yield { key: synthKey(i), vector };
+  }
+}
+
+const pct = (xs: number[], q: number): number => {
+  const sorted = [...xs].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0;
+};
+
+async function annBuild(): Promise<void> {
+  const s = await createStore({ driver: 'auto', events: eventSink });
+  try {
+    ui.annStatus.textContent = `[${stamp()}] building ${ANN_ROWS.toLocaleString('en-US')} rows and the graph on ${s.driver} (replaces the previous ones)...`;
+    await s.clear(ANN_NS);
+    let t0 = performance.now();
+    await s.putVectors(ANN_NS, annRows());
+    annBuildFacts.flatMs = performance.now() - t0;
+    t0 = performance.now();
+    const built = await s.buildIndex(ANN_NS, {
+      kind: 'hnsw',
+      m: 16,
+      efConstruction: 200,
+      seed: 1,
+    });
+    annBuildFacts.graphMs = performance.now() - t0;
+    annBuildFacts.built = true;
+    ui.annStatus.textContent =
+      `[${stamp()}] built ${built.liveRows.toLocaleString('en-US')} rows on ${s.driver}: flat write ${annBuildFacts.flatMs.toFixed(0)} ms, ` +
+      `graph ${annBuildFacts.graphMs.toFixed(0)} ms (${fmtBytes(built.bytes)}). Pick an index kind and press "Run 50 queries".`;
+  } finally {
+    await s.close();
+  }
+}
+
+async function annRunQueries(): Promise<void> {
+  const kind = ui.annKind.value === 'flat' ? 'flat' : 'hnsw';
+  const seen: Event[] = [];
+  const s = await createStore({ driver: 'auto', events: annSink(seen) });
+  try {
+    const info = await s.indexInfo(ANN_NS);
+    if (!info) {
+      ui.annStatus.textContent = `[${stamp()}] no index in this browser: press Build first.`;
+      ui.annFacts.hidden = true;
+      return;
+    }
+    const qs = annQueries();
+    const run = async (index: 'flat' | 'hnsw') => {
+      const lat: number[] = [];
+      const keys: string[][] = [];
+      for (const q of qs) {
+        const t0 = performance.now();
+        const hits = await s.query(ANN_NS, q, 10, { index, values: false });
+        lat.push(performance.now() - t0);
+        keys.push(hits.map((h) => h.key));
+      }
+      return { lat, keys };
+    };
+    // One untimed query first so loading the vectors (and the graph) is not counted as a query.
+    await s.query(ANN_NS, qs[0]!, 10, { index: kind, values: false });
+    const timed = await run(kind);
+    const last = [...seen].reverse().find((e) => e.name === 'storage.query');
+    const answeredBy = String(last?.attrs['index'] ?? '?');
+    const fallback = String(last?.attrs['fallback'] ?? '');
+    let recall = 1;
+    if (kind === 'hnsw') {
+      const truth = (await run('flat')).keys;
+      let sum = 0;
+      timed.keys.forEach((got, i) => {
+        sum += got.filter((k) => truth[i]!.includes(k)).length / Math.max(1, truth[i]!.length);
+      });
+      recall = sum / timed.keys.length;
+    }
+    const usage = await s.usage(ANN_NS);
+    const refused = seen.find(
+      (e) =>
+        e.name === 'storage.index.open' &&
+        e.attrs['kind'] === 'hnsw' &&
+        e.attrs['outcome'] === 'corrupt',
+    );
+    const rebuilt = seen.find(
+      (e) => e.name === 'storage.index.build' && e.attrs['reason'] === 'rebuild',
+    );
+    ui.annFacts.hidden = false;
+    ui.annWhich.textContent =
+      `${kind}, answered by ${answeredBy}` +
+      (fallback !== '' ? ` (fell back: ${fallback})` : '') +
+      `; ${info.rows.toLocaleString('en-US')} rows, dim ${info.dim}`;
+    ui.annBuildTime.textContent = annBuildFacts.built
+      ? `${annBuildFacts.flatMs.toFixed(0)} ms, ${annBuildFacts.graphMs.toFixed(0)} ms (this page load)`
+      : 'built in an earlier page load (press Build to time it again)';
+    ui.annTime.textContent = `${pct(timed.lat, 0.5).toFixed(2)} ms, ${pct(timed.lat, 0.95).toFixed(2)} ms`;
+    ui.annRecall.textContent =
+      kind === 'hnsw'
+        ? `${recall.toFixed(3)} (1.000 means all of the exact top 10 for every query)`
+        : '1.000 by definition: flat is the exact scan';
+    ui.annBytes.textContent = `${fmtBytes(usage.annBytes ?? 0)} (${usage.annBytes ?? 0} bytes), ${fmtBytes(info.bytes)}`;
+    ui.annEvents.textContent =
+      refused !== undefined
+        ? `graph refused (reason ${String(refused.attrs['reason'])})` +
+          (rebuilt !== undefined
+            ? `, rebuilt from the stored vectors in ${(rebuilt.durationMs ?? 0).toFixed(0)} ms (outcome ${String(rebuilt.attrs['outcome'])})`
+            : ', not rebuilt')
+        : 'none: the graph passed validation';
+    ui.annStatus.textContent = `[${stamp()}] ${kind} answered 50 queries${answeredBy !== kind ? ` (the ${answeredBy} index answered)` : ''}; recall@10 ${recall.toFixed(3)}.`;
+  } finally {
+    await s.close();
+  }
+}
+
+async function annCorrupt(): Promise<void> {
+  const s = await createStore({ driver: 'auto' });
+  const driverName = s.driver;
+  await s.close();
+  const d = driverName === 'opfs' ? new OpfsDriver() : new IndexedDbDriver();
+  await d.open();
+  try {
+    // Only this demo's own graph namespace: ANN_NS_PREFIX + 'demo-ann', record 'graph'.
+    const rec = await d.getBytes(`${ANN_NS_PREFIX}${ANN_NS}`, 'graph');
+    if (!rec) {
+      ui.annStatus.textContent = `[${stamp()}] there is no graph to corrupt: press Build first.`;
+      return;
+    }
+    const cut = rec.bytes.byteLength >> 1;
+    await d.put(`${ANN_NS_PREFIX}${ANN_NS}`, 'graph', rec.bytes.slice(0, cut), { size: cut });
+    ui.annStatus.textContent = `[${stamp()}] truncated the graph record of ${ANN_NS} on ${driverName} (${rec.bytes.byteLength} to ${cut} bytes); the vectors are untouched. Pick hnsw and press "Run 50 queries".`;
+  } finally {
+    await d.close();
+  }
+}
+
+async function annDelete(): Promise<void> {
+  const s = await createStore({ driver: 'auto', events: eventSink });
+  try {
+    const before = await s.usage(ANN_NS);
+    await s.clear(ANN_NS);
+    annBuildFacts.built = false;
+    ui.annFacts.hidden = true;
+    ui.annStatus.textContent = `[${stamp()}] index deleted (${fmtBytes(before.bytes)} freed).`;
+  } finally {
+    await s.close();
+  }
+}
+
+function wireAnn(): void {
+  ui.annBuild.addEventListener('click', () => void annRunGuarded(annBuild));
+  ui.annRun.addEventListener('click', () => void annRunGuarded(annRunQueries));
+  ui.annCorrupt.addEventListener('click', () => void annRunGuarded(annCorrupt));
+  ui.annReload.addEventListener('click', () => location.reload());
+  ui.annDelete.addEventListener('click', () => void annRunGuarded(annDelete));
+  if (!opfsAvailable() && !indexedDbAvailable()) {
+    ui.annStatus.textContent = 'Neither OPFS nor IndexedDB is available in this browser.';
+    annSetBusy(true);
+  }
+}
+
 // ----- documents (Storage API 0.3.0) ----------------------------------------------------------
 
 // Its own store (driver 'auto'), closed after every action so Reload page then List documents is a genuine
@@ -999,6 +1252,7 @@ function wire(): void {
   ui.close.addEventListener('click', () => void closeStore());
   wireKv();
   wireVectors();
+  wireAnn();
   wireDocuments();
   ui.persist.addEventListener('click', async () => {
     try {
