@@ -59,6 +59,11 @@ export interface PutOutcome {
   bytes: number;
   /** True when the caller must drop its resident copy (it could not be extended in place). */
   invalidate: boolean;
+  /** Row ordinal of the first row this call appended, and how many it appended (the graph inserts these). */
+  firstNewRow: number;
+  newRows: number;
+  /** Ordinals of the live rows this call replaced or retired (the graph marks their nodes deleted). */
+  replacedRows: number[];
 }
 
 function invalidValue(reason: string, row: number): StorageError {
@@ -248,6 +253,13 @@ export interface PutOptions {
    * on open removes them.
    */
   restart?: boolean;
+  /**
+   * 0.4.0: the HNSW graph the namespace carries. `annBytes` are its bytes (they count toward maxIndexBytes)
+   * and `annPerRow` an upper bound on the bytes one more row adds to it (rows written so far count toward the
+   * pre-write quota checks). Both are absent for a flat-only namespace, whose checks are unchanged.
+   */
+  annBytes?: number;
+  annPerRow?: number;
 }
 
 class SegmentBuilder {
@@ -344,16 +356,26 @@ export async function putVectors(
     return scratch.ptr;
   };
 
+  const annGrowth = (): number => (opts.annPerRow ?? 0) * callRow;
   const quota = (vecAdd: number, builder: SegmentBuilder): void => {
     const proj = metaLength(builder.rows, builder.keyBytes.n);
-    if (oldIndexBytes + newVecBytes + newMetaBytes + vecAdd + proj > maxIndexBytes) {
+    if (
+      oldIndexBytes +
+        (opts.annBytes ?? 0) +
+        newVecBytes +
+        newMetaBytes +
+        vecAdd +
+        proj +
+        annGrowth() >
+      maxIndexBytes
+    ) {
       throw new StorageError(
         'quota_exceeded',
         'the index would exceed maxIndexBytes; raise the option or split the data across namespaces',
         { reason: 'max_index_bytes', maxIndexBytes },
       );
     }
-    ctx.checkSoft(writtenBytes + vecAdd + proj);
+    ctx.checkSoft(writtenBytes + vecAdd + proj + annGrowth());
   };
 
   const flushBlock = async (): Promise<void> => {
@@ -576,6 +598,9 @@ export async function putVectors(
         segments: 0,
         bytes: 0,
         invalidate: false,
+        firstNewRow: oldRows,
+        newRows: 0,
+        replacedRows: [],
       };
     }
     await finishSegment();
@@ -609,7 +634,7 @@ export async function putVectors(
       segs,
       tomb,
     });
-    ctx.checkSoft(writtenBytes + head.byteLength);
+    ctx.checkSoft(writtenBytes + head.byteLength + annGrowth());
     await commitHead(ctx, head);
     committed = true;
     writtenBytes += head.byteLength;
@@ -659,6 +684,9 @@ export async function putVectors(
       segments: segs.length,
       bytes: writtenBytes,
       invalidate,
+      firstNewRow: oldRows,
+      newRows: callRow,
+      replacedRows,
     };
   } catch (e) {
     free();

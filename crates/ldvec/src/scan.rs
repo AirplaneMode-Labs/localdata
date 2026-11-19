@@ -116,6 +116,24 @@ pub fn inv_norms(vec: &[f32], rows: usize, dim: usize, out: &mut [f32]) {
     }
 }
 
+/// The score of one row against a query, exactly as [`scan`] computes it: dot metric is the plain
+/// `dot4`, cosine is `(dot * row_inv_norm) * q_inv_norm`, and -0 becomes +0. The HNSW kernel scores
+/// every candidate through this one function, so its scores equal the flat scan's bit for bit.
+#[inline]
+pub fn score_one(row: &[f32], row_inv_norm: f32, q: &[f32], q_inv_norm: f32, metric: u32) -> f32 {
+    let d = dot4(row, q);
+    let s = if metric == METRIC_DOT {
+        d
+    } else {
+        (d * row_inv_norm) * q_inv_norm
+    };
+    if s == 0.0 {
+        0.0
+    } else {
+        s
+    }
+}
+
 /// Scores `rows` rows against `q` into `out[0..rows]`. `metric` is [`METRIC_COSINE`] (0) or
 /// [`METRIC_DOT`] (1); `norms` (the rows' inverse norms) is read only for cosine. -0 becomes +0.
 #[allow(clippy::too_many_arguments)]
@@ -130,12 +148,7 @@ pub fn scan(
     out: &mut [f32],
 ) {
     for r in 0..rows {
-        let d = dot4(&vec[r * dim..(r + 1) * dim], q);
-        let s = if metric == METRIC_DOT {
-            d
-        } else {
-            (d * norms[r]) * q_inv_norm
-        };
-        out[r] = if s == 0.0 { 0.0 } else { s };
+        let n = if metric == METRIC_DOT { 0.0 } else { norms[r] };
+        out[r] = score_one(&vec[r * dim..(r + 1) * dim], n, q, q_inv_norm, metric);
     }
 }

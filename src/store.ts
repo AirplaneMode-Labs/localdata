@@ -3,6 +3,8 @@ import {
   STORAGE_KEY_MAX,
   STORAGE_NS_PATTERN,
   StorageError,
+  type BuildIndexOptions,
+  type BuildIndexResult,
   type ChunkHit,
   type ChunkInput,
   type DocumentInfo,
@@ -494,6 +496,26 @@ export class LocalData implements StorageApi {
     return this.vec.indexInfo(ns);
   }
 
+  // ----- HNSW (Storage API 0.4.0) -----------------------------------------------------------------
+
+  async buildIndex(ns: string, opts: BuildIndexOptions): Promise<BuildIndexResult> {
+    const t0 = this.ev.start();
+    try {
+      this.ensureOpen();
+      validateNamespace(ns);
+    } catch (e) {
+      this.ev.indexBuild(t0, ns, outcomeOf(e), 'build', 0, 0, 0, 0, 0);
+      throw e;
+    }
+    return this.vec.buildIndex(ns, opts);
+  }
+
+  async dropIndex(ns: string, kind: 'hnsw'): Promise<boolean> {
+    this.ensureOpen();
+    validateNamespace(ns);
+    return this.vec.dropIndex(ns, kind);
+  }
+
   /** @internal WebAssembly memory held by this store's kernels (vector index and documents), in bytes (benchmarks, demo). */
   vectorWasmBytes(): number {
     return this.vec.wasmMemoryBytes() + this.docs.wasmMemoryBytes();
@@ -593,11 +615,6 @@ export class LocalData implements StorageApi {
     this.ev.redact(prefix);
   }
 
-  /** @internal Test hook: the n-th next kernel call (0 = next) traps for real. */
-  armVectorTrapForTest(afterCalls = 0): void {
-    this.vec.armTrapForTest(afterCalls);
-  }
-
   async usage(ns?: string): Promise<UsageResult> {
     this.ensureOpen();
     const nested = this.ev.nested;
@@ -621,9 +638,11 @@ export class LocalData implements StorageApi {
     const out: UsageResult = { bytes, items };
     const vec = await this.vec.usage(ns);
     if (vec !== undefined) {
-      out.bytes += vec.bytes;
+      // The graph's bytes are in `bytes` and reported on their own; vectorBytes is the flat index only.
+      out.bytes += vec.bytes + (vec.annBytes ?? 0);
       out.vectorRows = vec.rows;
       out.vectorBytes = vec.bytes;
+      if (vec.annBytes !== undefined) out.annBytes = vec.annBytes;
     }
     const docs = await this.docs.docUsage(ns);
     if (docs !== undefined) {

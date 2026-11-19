@@ -36,6 +36,26 @@ export const KERNEL_REASONS: Readonly<Record<number, string>> = Object.freeze({
 /** Returned by the kernel for an out-of-range or misaligned pointer; no format code uses it. */
 export const E_ARGS = -100;
 
+/**
+ * The HNSW graph error codes (docs/hnsw-format.md). The reasons are the `reason` values of a
+ * storage.index.open event for a refused graph (-30 is memory exhaustion, not a refusal).
+ */
+export const HNSW_REASONS: Readonly<Record<number, string>> = Object.freeze({
+  [-20]: 'magic',
+  [-21]: 'version',
+  [-22]: 'length',
+  [-23]: 'dim',
+  [-24]: 'ns',
+  [-25]: 'generation',
+  [-26]: 'bounds',
+  [-27]: 'links',
+  [-28]: 'crc',
+});
+/** Returned when an allocation inside the kernel failed (reported as quota_exceeded, 'wasm_memory'). */
+export const E_HNSW_MEMORY = -30;
+/** u32 words ldv_hnsw_info writes. */
+export const HNSW_INFO_WORDS = 12;
+
 /** u32 words ldv_parse_head writes before the segment entries, and per entry. */
 export const HEAD_OUT_WORDS = 12;
 export const SEG_OUT_WORDS = 8;
@@ -76,6 +96,56 @@ interface Exports {
     valueBytesLen: number,
   ): number;
   ldv_simd(): number;
+  ldv_hnsw_build(
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    dim: number,
+    tombPtr: number,
+    tombLen: number,
+    nsPtr: number,
+    nsLen: number,
+    metric: number,
+    m: number,
+    efConstruction: number,
+    seed: number,
+    generation: number,
+  ): number;
+  ldv_hnsw_load(
+    ptr: number,
+    len: number,
+    dim: number,
+    rows: number,
+    headGeneration: number,
+    nsPtr: number,
+    nsLen: number,
+  ): number;
+  ldv_hnsw_info(handle: number, outPtr: number): number;
+  ldv_hnsw_insert(
+    handle: number,
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    first: number,
+    count: number,
+  ): number;
+  ldv_hnsw_mark_deleted(handle: number, ordinal: number): number;
+  ldv_hnsw_set_generation(handle: number, generation: number): number;
+  ldv_hnsw_search(
+    handle: number,
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    tombPtr: number,
+    tombLen: number,
+    qPtr: number,
+    ef: number,
+    outPtr: number,
+    outCap: number,
+  ): number;
+  ldv_hnsw_serialize_len(handle: number): number;
+  ldv_hnsw_serialize(handle: number, outPtr: number, outLen: number): number;
+  ldv_hnsw_free(handle: number): void;
 }
 
 // A v128 module that only validates when the engine supports WebAssembly SIMD.
@@ -135,6 +205,7 @@ export function assertU32(n: number, what: string): void {
 export class Kernel {
   private dead = false;
   private trapAfter: number | undefined;
+  private trapOnHnsw = false;
 
   private constructor(
     readonly kind: KernelKind,
@@ -157,9 +228,14 @@ export class Kernel {
     return this.x.memory.buffer.byteLength;
   }
 
-  /** Test hook: the n-th next boundary call (0 = the very next) traps for real (out-of-range read). */
-  armTrapForTest(afterCalls = 0): void {
-    this.trapAfter = afterCalls;
+  private callHnsw<T>(fn: () => T): T {
+    return this.call(() => {
+      if (this.trapOnHnsw) {
+        this.trapOnHnsw = false;
+        this.x.ldv_crc32c(0, 0x7fff_fff0, 64);
+      }
+      return fn();
+    });
   }
 
   private call<T>(fn: () => T): T {
@@ -266,5 +342,164 @@ export class Kernel {
   checkMeta(ptr: number, len: number, rows: number, keyBytesLen: number, valueBytesLen: number) {
     assertU32(len, 'meta length');
     return this.call(() => this.x.ldv_check_meta(ptr, len, rows, keyBytesLen, valueBytesLen));
+  }
+
+  // ---- HNSW (docs/hnsw-format.md) ---------------------------------------------------------------
+  //
+  // A graph is an integer handle (> 0) into the instance; a negative return is a code (HNSW_REASONS,
+  // E_HNSW_MEMORY, E_ARGS). The vectors are lent through a block table of u32 words
+  // [firstRow, rows, vecPtr, normsPtr] covering rows 0..total.
+
+  hnswBuild(
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    dim: number,
+    tombPtr: number,
+    tombLen: number,
+    nsPtr: number,
+    nsLen: number,
+    metric: number,
+    m: number,
+    efConstruction: number,
+    seed: number,
+    generation: number,
+  ): number {
+    assertU32(total, 'rows');
+    return this.callHnsw(() =>
+      this.x.ldv_hnsw_build(
+        tablePtr,
+        nBlocks,
+        total,
+        dim,
+        tombPtr,
+        tombLen,
+        nsPtr,
+        nsLen,
+        metric,
+        m,
+        efConstruction,
+        seed,
+        generation,
+      ),
+    );
+  }
+
+  hnswLoad(
+    ptr: number,
+    len: number,
+    dim: number,
+    rows: number,
+    headGeneration: number,
+    nsPtr: number,
+    nsLen: number,
+  ): number {
+    assertU32(len, 'graph length');
+    assertU32(rows, 'rows');
+    return this.callHnsw(() =>
+      this.x.ldv_hnsw_load(ptr, len, dim, rows, headGeneration, nsPtr, nsLen),
+    );
+  }
+
+  hnswInfo(handle: number, outPtr: number): number {
+    return this.callHnsw(() => this.x.ldv_hnsw_info(handle, outPtr));
+  }
+
+  /**
+   * How many graph handles (1..max) this instance holds right now, found by asking the kernel about each
+   * handle number. The kernel answers a full handle table and an exhausted heap with the same code
+   * (E_HNSW_MEMORY); the caller uses this on that failure path only, to tell them apart (BUG-T2-S6-03),
+   * so the `max` calls cost nothing that matters. Returns -1 when the scratch buffer cannot be allocated
+   * (memory really is exhausted). A trap propagates as KernelTrapError.
+   */
+  hnswLiveHandles(max: number): number {
+    let p: number;
+    try {
+      p = this.alloc(HNSW_INFO_WORDS * 4);
+    } catch (e) {
+      if (e instanceof StorageError) return -1;
+      throw e;
+    }
+    try {
+      let live = 0;
+      for (let h = 1; h <= max; h++) if (this.hnswInfo(h, p) === 0) live++;
+      return live;
+    } finally {
+      this.free(p, HNSW_INFO_WORDS * 4);
+    }
+  }
+
+  hnswInsert(
+    handle: number,
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    first: number,
+    count: number,
+  ): number {
+    assertU32(total, 'rows');
+    return this.callHnsw(() =>
+      this.x.ldv_hnsw_insert(handle, tablePtr, nBlocks, total, first, count),
+    );
+  }
+
+  hnswMarkDeleted(handle: number, ordinal: number): number {
+    assertU32(ordinal, 'ordinal');
+    return this.callHnsw(() => this.x.ldv_hnsw_mark_deleted(handle, ordinal));
+  }
+
+  hnswSetGeneration(handle: number, generation: number): number {
+    assertU32(generation, 'generation');
+    return this.callHnsw(() => this.x.ldv_hnsw_set_generation(handle, generation));
+  }
+
+  hnswSearch(
+    handle: number,
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    tombPtr: number,
+    tombLen: number,
+    qPtr: number,
+    ef: number,
+    outPtr: number,
+    outCap: number,
+  ): number {
+    assertU32(total, 'rows');
+    assertU32(tombLen, 'tombstone length');
+    return this.callHnsw(() =>
+      this.x.ldv_hnsw_search(
+        handle,
+        tablePtr,
+        nBlocks,
+        total,
+        tombPtr,
+        tombLen,
+        qPtr,
+        ef,
+        outPtr,
+        outCap,
+      ),
+    );
+  }
+
+  hnswSerializeLen(handle: number): number {
+    return this.callHnsw(() => this.x.ldv_hnsw_serialize_len(handle));
+  }
+
+  hnswSerialize(handle: number, outPtr: number, outLen: number): number {
+    assertU32(outLen, 'graph length');
+    return this.callHnsw(() => this.x.ldv_hnsw_serialize(handle, outPtr, outLen));
+  }
+
+  /** Frees a graph. Never throws: a dead instance already lost it. */
+  hnswFree(handle: number): void {
+    if (this.dead || handle <= 0) return;
+    try {
+      this.x.ldv_hnsw_free(handle);
+    } catch (e) {
+      if (e instanceof WebAssembly.RuntimeError) this.dead = true;
+      else throw e;
+    }
   }
 }

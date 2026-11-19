@@ -3,12 +3,14 @@ name = "ldvec"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.98"
-description = "Flat vector index kernel for @airplanemode/localdata: CRC-32C, on-disk validation, norms and a bit-exact SIMD or scalar scan."
+description = "Vector index kernel for @airplanemode/localdata: CRC-32C, on-disk validation, norms, a bit-exact SIMD or scalar flat scan, and an in-house HNSW graph (build, search, insert, serialise and validate), with no dependencies."
 license = "Apache-2.0"
 publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Zero dependencies on purpose (build-or-adopt rule TD-17): the scan is about 300 lines.
+# Zero dependencies on purpose (build-or-adopt rules TD-17 and TD-65): the flat scan, the on-disk
+# validation and the in-house HNSW graph (about 1,050 lines in src/hnsw.rs; about 2,200 lines under src/ in
+# all) are all a buyer has to audit, and no third-party crate enters the tree.
 [dependencies]

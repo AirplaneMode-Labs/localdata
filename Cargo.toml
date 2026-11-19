@@ -12,3 +12,8 @@ panic = "abort"
 codegen-units = 1
 debug = false
 strip = true
+
+# The HNSW tests build graphs over 10,000 x 384 vectors and fuzz the validator 10,000 times: an
+# unoptimised test build would take many minutes. Debug assertions and overflow checks stay on.
+[profile.test]
+opt-level = 3

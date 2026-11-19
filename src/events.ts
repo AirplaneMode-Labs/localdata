@@ -103,6 +103,15 @@ export const BUILTIN_REDACTED_PREFIXES: readonly string[] = Object.freeze(['dock
 /** At most this many prefixes can be registered through redactNamespacePrefix(). */
 export const REDACTED_PREFIXES_MAX = 16;
 
+/** The 0.1.5 attrs of storage.query: which index was asked for, which answered, why not the asked one. */
+export interface QueryAnnAttrs {
+  requested: 'flat' | 'hnsw';
+  index: 'flat' | 'hnsw';
+  fallback: '' | 'absent' | 'stale' | 'filter' | 'metric' | 'short' | 'refused' | 'trap';
+  ef: number | null;
+}
+const FLAT_QUERY: QueryAnnAttrs = { requested: 'flat', index: 'flat', fallback: '', ef: null };
+
 export type DocPutOutcome = 'ok' | StorageErrorCode;
 export type DocDeleteOutcome = 'removed' | 'absent' | StorageErrorCode;
 
@@ -154,7 +163,9 @@ export class StorageEvents {
 
   /**
    * storage.query. Never the query vector, filterPrefix, keys, scores or values. `kernel` is the
-   * scan kernel in use, or 'none' when no kernel had been created.
+   * scan kernel in use, or 'none' when no kernel had been created. Since Event 0.1.5 also `requested`
+   * (QueryOptions.index as given, default 'flat'), `index` (the index that answered), `fallback` ('' or
+   * why the flat scan answered a request for 'hnsw') and `ef` (the effective HNSW ef, or null).
    */
   query(
     startedAt: number,
@@ -164,6 +175,7 @@ export class StorageEvents {
     candidates: number,
     metric: string,
     kernel: string,
+    ann: QueryAnnAttrs = FLAT_QUERY,
   ): void {
     this.timing(
       'storage.query',
@@ -177,6 +189,10 @@ export class StorageEvents {
         candidates,
         metric,
         kernel,
+        requested: ann.requested,
+        index: ann.index,
+        fallback: ann.fallback,
+        ef: ann.ef,
       },
     );
   }
@@ -195,6 +211,7 @@ export class StorageEvents {
     kernel: string,
     bytes: number,
     swept = 0,
+    kind: 'flat' | 'hnsw' = 'flat',
   ): void {
     this.timing(
       'storage.index.open',
@@ -203,7 +220,35 @@ export class StorageEvents {
       outcome,
       outcome === 'ok' || outcome === 'absent' ? 'debug' : 'warn',
       bytes,
-      { rows, segments, reason, kernel, swept },
+      { rows, segments, reason, kernel, swept, kind },
+    );
+  }
+
+  /**
+   * storage.index.build (Event 0.1.5): a buildIndex() call ('build' on a namespace without a graph,
+   * 'replace' over one) or the SDK's rebuild of a refused graph ('rebuild'). `bytes` is the graph bytes
+   * written. Never a key, a vector, a score or the seed.
+   */
+  indexBuild(
+    startedAt: number,
+    ns: string,
+    outcome: string,
+    reason: 'build' | 'rebuild' | 'replace',
+    rows: number,
+    liveRows: number,
+    dim: number,
+    m: number,
+    efConstruction: number,
+    bytes?: number,
+  ): void {
+    this.timing(
+      'storage.index.build',
+      startedAt,
+      ns,
+      outcome,
+      outcome === 'ok' ? 'debug' : 'warn',
+      bytes,
+      { kind: 'hnsw', reason, rows, liveRows, dim, m, efConstruction },
     );
   }
 

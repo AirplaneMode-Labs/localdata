@@ -1,6 +1,7 @@
 // @airplanemode/localdata: set/get/delete/query over OPFS with an IndexedDB fallback, a flat vector
-// index (putVectors/query) and a documents API (putDocument/queryChunks/deleteDocument) persisted beside
-// the values. Implements the Storage API contract 0.3.0 vendored from AirplaneMode-Labs/runtime spec/.
+// index (putVectors/query) with an optional HNSW graph (buildIndex, query({ index: 'hnsw' })) and a documents API
+// (putDocument/queryChunks/deleteDocument) persisted beside the values. Implements the Storage API contract 0.4.0
+// vendored from AirplaneMode-Labs/runtime spec/.
 import { StorageError, type StorageDriver } from './contracts/storage-api';
 import { IndexedDbDriver } from './drivers/indexeddb';
 import { MemoryDriver } from './drivers/memory';
@@ -38,8 +39,8 @@ export interface CreateStoreOptions {
   /** Injectable clock in epoch milliseconds (TTL); defaults to Date.now. */
   clock?: () => number;
   /**
-   * Optional EventSink receiving the storage.* events (Event 0.1.4, source "localdata": set, get, delete,
-   * quota, query, index.open, index.write and the documents' doc.put, doc.delete, doc.query). Never receives
+   * Optional EventSink receiving the storage.* events (Event 0.1.5, source "localdata": set, get, delete,
+   * quota, query, index.open, index.write, index.build and the documents' doc.put, doc.delete, doc.query). Never receives
    * a key, prefix, value, docId, title or chunk text; the namespace does appear (a namespace under a
    * registered prefix, 'dockit.d' by default, appears as prefix + '*'). Called synchronously inside try/catch and never awaited.
    */

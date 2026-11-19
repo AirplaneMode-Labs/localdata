@@ -186,6 +186,24 @@ const NEEDLES = [
   repo,
 ];
 const dts = readFileSync(join(installed, 'dist', 'index.d.ts'), 'utf8');
+// BUG-T2-S6-07, BUG-T2-S6-12: test hooks live in src/vec/ann-test-hook.ts, which no shipped module imports.
+// No name ending in "ForTest" and none of the hook module's function names may reach a shipped file.
+const forTest = [
+  ...new Set(
+    [...js.matchAll(/\b\w*ForTest\b/gu), ...dts.matchAll(/\b\w*ForTest\b/gu)].map((m) => m[0]),
+  ),
+];
+check(
+  forTest.length === 0,
+  `no identifier ending in ForTest in dist/index.js or dist/index.d.ts${forTest.length > 0 ? ` (found ${forTest.join(', ')})` : ''}`,
+);
+const hookNames = ['armAnnTrap', 'armVectorTrap', 'annStats', 'ann-test-hook'].filter(
+  (n) => js.includes(n) || dts.includes(n),
+);
+check(
+  hookNames.length === 0,
+  `no test hook function (armAnnTrap, armVectorTrap, annStats) in dist/index.js or dist/index.d.ts${hookNames.length > 0 ? ` (found ${hookNames.join(', ')})` : ''}`,
+);
 for (const n of NEEDLES) {
   check(!js.includes(n), `dist/index.js has no ${JSON.stringify(n)}`);
   check(!dts.includes(n), `dist/index.d.ts has no ${JSON.stringify(n)}`);
@@ -248,6 +266,19 @@ await v.putVectors('docs', [
 ]);
 const hits = await v.query('docs', new Float32Array([1, 0.1, 0]), 3);
 const info = await v.indexInfo('docs');
+// HNSW (Storage API 0.4.0): build a graph and ask for it; the answer is the flat answer and the graph answered.
+const hnswEvents = [];
+const h = await createStore({ driver: 'memory', events: { emit: (e) => hnswEvents.push(e) } });
+await h.putVectors('docs', [
+  { key: 'alpha', vector: new Float32Array([1, 0, 0]) },
+  { key: 'bravo', vector: new Float32Array([0, 1, 0]) },
+  { key: 'charlie', vector: new Float32Array([0.7, 0.7, 0]) },
+]);
+const built = await h.buildIndex('docs', { kind: 'hnsw', m: 4, efConstruction: 8, seed: 7 });
+const annHits = await h.query('docs', new Float32Array([1, 0.1, 0]), 3, { index: 'hnsw', ef: 16 });
+const annInfo = (await h.indexInfo('docs'))?.ann ?? null;
+const annUsage = (await h.usage('docs')).annBytes ?? null;
+await h.close();
 await v.close();
 const docEvents = [];
 const d = await createStore({ driver: 'memory', events: { emit: (e) => docEvents.push(e) } });
@@ -282,6 +313,17 @@ console.log(JSON.stringify({
   leaked: JSON.stringify(events).includes('probe-key'),
   keys: hits.map((h) => h.key),
   firstValue: hits[0]?.value ?? null,
+  hnsw: {
+    built,
+    keys: annHits.map((x) => x.key),
+    scores: annHits.map((x) => x.score),
+    flatScores: hits.map((x) => x.score),
+    info: annInfo,
+    usageAnnBytes: annUsage,
+    answeredBy: hnswEvents.filter((e) => e.name === 'storage.query').map((e) => [e.attrs.index, e.attrs.fallback]),
+    builds: hnswEvents.filter((e) => e.name === 'storage.index.build').map((e) => [e.attrs.reason, e.attrs.outcome]),
+    leaked: ['alpha', 'bravo', 'charlie'].filter((x) => JSON.stringify(hnswEvents).includes(x)),
+  },
   rows: info?.rows,
   kernel: info?.kernel,
   docs: {
@@ -326,6 +368,21 @@ check(
     (r.kernel === 'simd' || r.kernel === 'scalar'),
   `putVectors of 3 rows and a query from the installed copy print the keys ${JSON.stringify(r.keys)} (kernel ${r.kernel})`,
 );
+
+check(
+  r.hnsw.built?.kind === 'hnsw' &&
+    r.hnsw.built.liveRows === 3 &&
+    r.hnsw.built.replaced === false &&
+    JSON.stringify(r.hnsw.keys) === JSON.stringify(['alpha', 'charlie', 'bravo']) &&
+    JSON.stringify(r.hnsw.scores) === JSON.stringify(r.hnsw.flatScores) &&
+    r.hnsw.info?.current === true &&
+    r.hnsw.info?.nodes === 3 &&
+    r.hnsw.usageAnnBytes > 0 &&
+    JSON.stringify(r.hnsw.answeredBy) === JSON.stringify([['hnsw', '']]) &&
+    JSON.stringify(r.hnsw.builds) === JSON.stringify([['build', 'ok']]),
+  'buildIndex and query({ index: "hnsw" }) from the installed copy: the graph answers with the flat scores and order',
+);
+check(r.hnsw.leaked.length === 0, 'no key appears in an HNSW event');
 
 check(
   JSON.stringify(r.docs.put) ===

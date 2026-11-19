@@ -1,6 +1,6 @@
 // Driver-facing types. The authoritative shapes are in the vendored contract; this module adds the
 // SDK-internal names drivers share.
-import type { DriverRecord } from '../contracts/storage-api';
+import { ANN_NS_PREFIX, type DriverRecord } from '../contracts/storage-api';
 
 export type {
   DriverPutMeta,
@@ -17,15 +17,20 @@ export const VEC_NS_PREFIX = '__ld_vec.';
 /** The documents of `ns` (Storage API 0.3.0) live in '__ld_doc.' + ns. */
 export const DOC_NS_PREFIX = '__ld_doc.';
 
-/** True for a driver namespace that holds an SDK index (vector or document), where a damaged keys.json is corruption. */
+export { ANN_NS_PREFIX };
+
+/** True for a driver namespace that holds an SDK index (vector, document or graph), where a damaged keys.json is corruption. */
 export function isIndexNamespace(ns: string): boolean {
-  return ns.startsWith(VEC_NS_PREFIX) || ns.startsWith(DOC_NS_PREFIX);
+  return (
+    ns.startsWith(VEC_NS_PREFIX) || ns.startsWith(DOC_NS_PREFIX) || ns.startsWith(ANN_NS_PREFIX)
+  );
 }
 
-/** The caller's namespace behind an index driver namespace (the namespace itself when it is neither). */
+/** The caller's namespace behind an index driver namespace (the namespace itself when it is none of them). */
 export function userNamespace(ns: string): string {
   if (ns.startsWith(VEC_NS_PREFIX)) return ns.slice(VEC_NS_PREFIX.length);
   if (ns.startsWith(DOC_NS_PREFIX)) return ns.slice(DOC_NS_PREFIX.length);
+  if (ns.startsWith(ANN_NS_PREFIX)) return ns.slice(ANN_NS_PREFIX.length);
   return ns;
 }
 

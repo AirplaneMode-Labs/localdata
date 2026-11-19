@@ -9,18 +9,38 @@
 //   * Any trap discards the kernel instance and every pointer into it; the next call starts fresh.
 //   * Errors and events never carry a key, filterPrefix, vector component, score or value.
 import {
+  ANN_NS_PREFIX,
+  HNSW_EF_DEFAULT_MIN,
+  HNSW_EF_MAX,
   StorageError,
+  type AnnIndexInfo,
+  type BuildIndexOptions,
+  type BuildIndexResult,
   type PutVectorsResult,
   type QueryHit,
   type QueryOptions,
   type StorageDriver,
   type StorableValue,
   type VectorIndexInfo,
+  type VectorMetric,
   type VectorRow,
 } from '../contracts/storage-api';
 import { DOC_NS_PREFIX, VEC_NS_PREFIX, type DriverHooks } from '../drivers/types';
 import { toStorageError } from '../errors';
-import type { StorageEvents } from '../events';
+import type { QueryAnnAttrs, StorageEvents } from '../events';
+import {
+  AnnManager,
+  AnnRefusedError,
+  PARAMS_BYTES,
+  annRowEstimate,
+  checkAnnQueryOptions,
+  checkBuildOptions,
+  encodeParams,
+  metricName,
+  type AnnFallback,
+  type AnnLoaded,
+  type AnnParams,
+} from './ann';
 import { Kernel, KernelTrapError, type KernelChoice, type KernelKind } from './kernel';
 import { VecFiles, corrupt, referencedRecords } from './files';
 import { OpenIndex, loadMeta, loadVec, readValue, type LoadCtx } from './reader';
@@ -33,6 +53,20 @@ import {
   type PutOutcome,
   type WriteCtx,
 } from './writer';
+
+/** What a graph-aware write carries from before the flat commit to after it. */
+interface AnnWrite {
+  g: AnnLoaded;
+  /** The flat HEAD generation the graph was current for before the write. */
+  headGen: number;
+}
+
+/** The answer of the graph path of a query: hits, or the reason the flat scan must answer. */
+interface AnnAnswer {
+  found?: { top: Array<{ row: number; score: number }>; candidates: number };
+  fallback: AnnFallback;
+  ef: number | null;
+}
 
 export interface VectorStoreOptions {
   driver: StorageDriver;
@@ -59,6 +93,8 @@ export interface Entry {
   headSig: string;
   stuck: StorageError | undefined;
   chain: Promise<unknown>;
+  /** Operations on this namespace running or queued in this store: its resident graph handle may be in use. */
+  active: number;
   /** Derived state a subclass keeps beside the index (the documents view); dropped with the entry. */
   ext: unknown;
 }
@@ -116,10 +152,21 @@ export class VectorStore {
   private closed = false;
   /** The reserved driver namespace prefix of this store's indexes. */
   protected readonly prefix: string;
+  /** The HNSW graphs of this store (Storage API 0.4.0). Only the generic vector store has them. */
+  protected readonly ann: AnnManager;
+  protected readonly annOn: boolean;
 
   constructor(protected readonly o: VectorStoreOptions) {
     this.d = o.driver as StorageDriver & DriverHooks;
     this.prefix = o.prefix ?? VEC_NS_PREFIX;
+    this.annOn = this.prefix === VEC_NS_PREFIX;
+    this.ann = new AnnManager({
+      driver: this.d,
+      events: o.events,
+      maxBytes: o.maxIndexBytes,
+      kernelKind: () => this.kernelKind(),
+      busy: (ns) => (this.entries.get(ns)?.active ?? 0) > 0,
+    });
   }
 
   /** The Web Lock name the writers of one index take: one lock per namespace and kind of index. */
@@ -140,6 +187,7 @@ export class VectorStore {
         headSig: '',
         stuck: undefined,
         chain: Promise.resolve(),
+        active: 0,
         ext: undefined,
       };
       this.entries.set(ns, e);
@@ -149,7 +197,16 @@ export class VectorStore {
 
   /** Serialises work on one namespace inside this store. */
   protected exclusive<T>(e: Entry, fn: () => Promise<T>): Promise<T> {
-    const run = e.chain.then(fn, fn);
+    // Counted from the call, not from when fn starts: a queued operation protects its graph from eviction too.
+    e.active++;
+    const guarded = async (): Promise<T> => {
+      try {
+        return await fn();
+      } finally {
+        e.active--;
+      }
+    };
+    const run = e.chain.then(guarded, guarded);
     e.chain = run.then(
       () => undefined,
       () => undefined,
@@ -174,6 +231,7 @@ export class VectorStore {
   private discardKernel(): void {
     this.kernel = undefined;
     this.kernelP = undefined;
+    this.ann.onKernelDiscarded();
     for (const e of this.entries.values()) {
       e.idx?.dispose();
       e.idx = undefined;
@@ -401,17 +459,55 @@ export class VectorStore {
     let outcome = 'ok';
     let candidates = 0;
     let metricName = 'cosine';
+    let annAttrs: QueryAnnAttrs = { requested: 'flat', index: 'flat', fallback: '', ef: null };
     try {
       checkK(k);
       checkQueryVector(vector);
       if (opts?.filterPrefix !== undefined) checkFilterPrefix(opts.filterPrefix);
       if (opts?.metric !== undefined) checkMetric(opts.metric);
+      const { requested, ef: efOpt } = checkAnnQueryOptions(opts);
+      annAttrs = { ...annAttrs, requested };
       const metric = opts?.metric ?? 'cosine';
       metricName = metric;
       const prefix = opts?.filterPrefix;
       const wantValues = opts?.values !== false;
       const e = this.entry(ns);
-      const idx = await this.exclusive(e, () => this.ensure(e, 'full'));
+      let answer: AnnAnswer | undefined;
+      const idx = await this.exclusive(e, async () => {
+        let i = await this.ensure(e, 'full');
+        if (requested === 'hnsw' && this.annOn) {
+          if (i !== undefined && vector.length !== i.dim) {
+            throw new StorageError(
+              'invalid_value',
+              'the query vector length differs from the index dim',
+              { reason: 'dim' },
+            );
+          }
+          if (i === undefined) answer = { fallback: 'absent', ef: null };
+          else {
+            try {
+              answer = await this.annQuery(e, i, vector, k, metric, prefix, efOpt);
+            } catch (err) {
+              if (!(err instanceof KernelTrapError)) throw err;
+              // A trap: this instance and everything that pointed into it are gone. The flat scan runs
+              // on a fresh one, never on the trapped instance.
+              this.discardKernel();
+              answer = { fallback: 'trap', ef: null };
+            }
+            // A rebuild may have reloaded the index, and a trap discarded it: the flat path needs it whole.
+            i = await this.ensure(e, 'full');
+          }
+        }
+        return i;
+      });
+      if (answer !== undefined) {
+        annAttrs = {
+          requested,
+          index: answer.found !== undefined ? 'hnsw' : 'flat',
+          fallback: answer.fallback,
+          ef: answer.found !== undefined ? answer.ef : null,
+        };
+      }
       if (idx === undefined) return [];
       if (vector.length !== idx.dim) {
         throw new StorageError(
@@ -423,7 +519,9 @@ export class VectorStore {
         );
       }
       if (k === 0 || idx.liveRows === 0) return [];
-      const found = this.scan(idx, vector, k, metric === 'dot' ? 1 : 0, prefix);
+      const found =
+        (answer as AnnAnswer | undefined)?.found ??
+        this.scan(idx, vector, k, metric === 'dot' ? 1 : 0, prefix);
       candidates = found.candidates;
       const hits: QueryHit[] = [];
       const ctx = this.ctx(e, idx.kernel);
@@ -446,7 +544,7 @@ export class VectorStore {
       outcome = se.code;
       throw se;
     } finally {
-      this.o.events.query(t0, ns, outcome, k, candidates, metricName, this.kernelKind());
+      this.o.events.query(t0, ns, outcome, k, candidates, metricName, this.kernelKind(), annAttrs);
     }
   }
 
@@ -540,13 +638,27 @@ export class VectorStore {
       return await this.exclusive(e, () =>
         withWebLock(this.lockName(ns), async () => {
           const idx = await this.refreshForWrite(e);
-          const out = await this.commitRows(e, idx, rows);
+          // With a current graph the new rows are inserted into it in the same lock: the vectors must be
+          // resident, and the graph's bytes count toward the pre-write quota checks.
+          const w = this.annOn ? await this.annPrepareWrite(e, idx) : undefined;
+          const out = await this.commitRows(
+            e,
+            idx,
+            rows,
+            w === undefined
+              ? undefined
+              : {
+                  annBytes: w.g.bytes + PARAMS_BYTES,
+                  annPerRow: annRowEstimate(w.g.params.m),
+                },
+          );
           stats = {
             rows: out.result.rows,
             replaced: out.result.replaced,
             segments: out.segments,
             bytes: out.bytes,
           };
+          if (w !== undefined) await this.annApplyPut(e, w, out);
           return out.result;
         }),
       );
@@ -593,7 +705,7 @@ export class VectorStore {
       const e = this.entry(ns);
       const idx = await this.exclusive(e, () => this.ensure(e, 'meta'));
       if (idx === undefined) return undefined;
-      return {
+      const info: VectorIndexInfo = {
         formatVersion: 1,
         dtype: 'f32',
         dim: idx.dim,
@@ -604,9 +716,480 @@ export class VectorStore {
         generation: idx.generation,
         kernel: idx.kernel.kind,
       };
+      if (this.annOn) {
+        const ann = await this.exclusive(e, () => this.annInfo(e, idx));
+        if (ann !== undefined) info.ann = ann;
+      }
+      return info;
     } catch (err) {
       throw this.convert(err, ns, false, 'indexInfo');
     }
+  }
+
+  // ---- HNSW (Storage API 0.4.0) -------------------------------------------------------------------
+
+  /**
+   * buildIndex: builds a graph over the live rows in stored order and replaces any existing one, in one
+   * commit under the writer lock. The graph is built and sized in memory first, so a quota refusal happens
+   * before anything is written.
+   */
+  async buildIndex(ns: string, opts: BuildIndexOptions): Promise<BuildIndexResult> {
+    const t0 = this.o.events.start();
+    let outcome = 'ok';
+    let reason: 'build' | 'replace' = 'build';
+    const st: {
+      rows: number;
+      liveRows: number;
+      dim: number;
+      m: number;
+      efc: number;
+      bytes?: number;
+    } = {
+      rows: 0,
+      liveRows: 0,
+      dim: 0,
+      m: 0,
+      efc: 0,
+    };
+    try {
+      if (!this.annOn) {
+        throw new StorageError('not_implemented', 'this index kind has no HNSW graph');
+      }
+      const p = checkBuildOptions(opts);
+      st.m = p.m;
+      st.efc = p.efConstruction;
+      const e = this.entry(ns);
+      return await this.exclusive(e, () =>
+        withWebLock(this.lockName(ns), async () => {
+          const head = await this.refreshForWrite(e);
+          if (head !== undefined) await this.ensure(e, 'full', true);
+          const idx = head === undefined ? undefined : e.idx;
+          st.dim = idx?.dim ?? 0;
+          const kernel = await this.getKernel();
+          const state = this.ann.state(ns);
+          this.d.refreshIndex?.(state.files.ans);
+          const existed = await state.files.exists();
+          reason = existed ? 'replace' : 'build';
+          // A cheap lower bound first, so a hopeless build is refused before it runs.
+          this.annQuotaCheck(ns, idx, 60 + 12 * (idx?.liveRows ?? 0));
+          const handle = this.ann.build(kernel, idx, ns, p);
+          let adopted = false;
+          try {
+            const bytes = this.ann.serialize(kernel, handle);
+            const info = this.ann.info(kernel, handle);
+            st.rows = info.nodes;
+            st.liveRows = info.liveNodes;
+            // The exact size, still before any write.
+            this.annQuotaCheck(ns, idx, bytes.byteLength);
+            try {
+              // Params first, then the graph: a crash between leaves params alone, which is no graph.
+              await state.files.putParams(encodeParams(p));
+              await state.files.putGraph(bytes);
+            } catch (err) {
+              this.ann.release(ns);
+              throw err;
+            }
+            this.ann.adopt(ns, kernel, handle, p, bytes.byteLength);
+            adopted = true;
+            st.bytes = bytes.byteLength;
+            return {
+              kind: 'hnsw' as const,
+              rows: info.nodes,
+              liveRows: info.liveNodes,
+              bytes: bytes.byteLength,
+              generation: info.generation,
+              replaced: existed,
+            };
+          } finally {
+            if (!adopted) kernel.hnswFree(handle);
+          }
+        }),
+      );
+    } catch (err) {
+      const se = this.convert(err, ns, true, 'buildIndex');
+      outcome = se.code;
+      throw se;
+    } finally {
+      this.o.events.indexBuild(
+        t0,
+        ns,
+        outcome,
+        reason,
+        st.rows,
+        st.liveRows,
+        st.dim,
+        st.m,
+        st.efc,
+        st.bytes,
+      );
+    }
+  }
+
+  /** dropIndex: removes the graph (both records). True when one existed. */
+  async dropIndex(ns: string, kind: 'hnsw'): Promise<boolean> {
+    try {
+      if ((kind as string) !== 'hnsw') {
+        throw new StorageError('invalid_value', "dropIndex only knows the kind 'hnsw'", {
+          reason: 'kind',
+        });
+      }
+      if (!this.annOn) return false;
+      const e = this.entry(ns);
+      return await this.exclusive(e, () =>
+        withWebLock(this.lockName(ns), async () => {
+          this.d.refreshIndex?.(this.ann.state(ns).files.ans);
+          return this.ann.remove(ns);
+        }),
+      );
+    } catch (err) {
+      throw this.convert(err, ns, true, 'dropIndex');
+    }
+  }
+
+  /**
+   * The exact pre-write checks for a graph of `graphBytes` bytes: the flat index plus the graph must fit
+   * maxIndexBytes, and the growth over the resident graph must fit the soft quota. Throws quota_exceeded
+   * with details.reason 'max_index_bytes' or 'quota'.
+   */
+  private annQuotaCheck(ns: string, idx: OpenIndex | undefined, graphBytes: number): void {
+    const flat = idx === undefined ? 0 : idx.vecBytes + idx.metaBytes;
+    if (flat + graphBytes + PARAMS_BYTES > this.o.maxIndexBytes) {
+      throw new StorageError(
+        'quota_exceeded',
+        'the graph would push the index past maxIndexBytes; raise the option or use the flat index',
+        { reason: 'max_index_bytes', maxIndexBytes: this.o.maxIndexBytes },
+      );
+    }
+    try {
+      this.o.checkSoft(ns, Math.max(0, graphBytes + PARAMS_BYTES - this.ann.residentBytesOf(ns)));
+    } catch (err) {
+      if (err instanceof StorageError && err.code === 'quota_exceeded') {
+        throw new StorageError('quota_exceeded', err.message, { ...err.details, reason: 'quota' });
+      }
+      throw err;
+    }
+  }
+
+  /** Drops the graph for good (until buildIndex): both records go and queries answer flat with 'refused'. */
+  private async annDrop(ns: string): Promise<void> {
+    await this.ann.remove(ns);
+    this.ann.state(ns).status = 'dropped';
+  }
+
+  /**
+   * The graph path of a query, inside the namespace mutex. Resolves the graph (loading, validating,
+   * rebuilding a refused one once) and searches it, or says why the flat scan must answer. A kernel trap
+   * propagates to the caller.
+   */
+  private async annQuery(
+    e: Entry,
+    idx: OpenIndex,
+    vector: Float32Array,
+    k: number,
+    metric: VectorMetric,
+    prefix: string | undefined,
+    efOpt: number | undefined,
+  ): Promise<AnnAnswer> {
+    const res = await this.annResolve(e, idx, metric === 'dot' ? 1 : 0, prefix);
+    if (!res.ok) return { fallback: res.fallback, ef: null };
+    const cur = res.idx;
+    const ef = Math.min(HNSW_EF_MAX, Math.max(efOpt ?? Math.max(HNSW_EF_DEFAULT_MIN, k), k));
+    if (k === 0 || cur.liveRows === 0) {
+      return { found: { top: [], candidates: 0 }, fallback: '', ef };
+    }
+    let hits;
+    try {
+      hits = this.ann.search(cur.kernel, cur, res.g, vector, ef);
+    } catch (err) {
+      if (err instanceof AnnRefusedError) {
+        await this.annDrop(e.ns);
+        return { fallback: 'refused', ef: null };
+      }
+      throw err;
+    }
+    // Liveness is the flat HEAD's, whatever the graph says: a candidate that is not a live row below the
+    // HEAD row count is never returned.
+    const want = Math.min(k, cur.liveRows);
+    const top = new TopK(want, (row) => cur.keys[row]!);
+    for (const h of hits)
+      if (h.row < cur.totalRows && !cur.isDeleted(h.row)) top.push(h.score, h.row);
+    // A graph can return fewer than min(k, live rows) hits (many identical vectors collapse its links, and a
+    // k above ef can never be filled): an answer that is short is not an answer. The exact flat scan runs
+    // instead, with the same scoring function and order, and the event says why (fallback 'short').
+    if (top.size < want) return { fallback: 'short', ef: null };
+    return { found: { top: top.result(), candidates: hits.length }, fallback: '', ef };
+  }
+
+  /** Finds the usable graph for a query: filter, refused, absent, stale and metric are the fallbacks. */
+  private async annResolve(
+    e: Entry,
+    idx: OpenIndex,
+    metric: 0 | 1,
+    prefix: string | undefined,
+  ): Promise<{ ok: true; g: AnnLoaded; idx: OpenIndex } | { ok: false; fallback: AnnFallback }> {
+    if (prefix !== undefined) return { ok: false, fallback: 'filter' };
+    const st = this.ann.state(e.ns);
+    if (st.status === 'dropped') return { ok: false, fallback: 'refused' };
+    this.ann.touch(e.ns);
+    let g = st.status === 'loaded' && st.g?.kernel === idx.kernel ? st.g : undefined;
+    if (g === undefined) {
+      const r = await this.ann.load(e.ns, idx, idx.kernel);
+      if (r.kind === 'absent') return { ok: false, fallback: 'absent' };
+      // The stored graph cannot be loaded right now (every handle in use): the exact flat scan answers and
+      // the stored record is left alone. The one case where 'absent' means "not loadable in this store now".
+      if (r.kind === 'busy') return { ok: false, fallback: 'absent' };
+      if (r.kind === 'params_refused') {
+        await this.annDrop(e.ns);
+        return { ok: false, fallback: 'refused' };
+      }
+      if (r.kind === 'refused') {
+        const rebuilt = await this.annRebuild(e, r.params);
+        if (rebuilt === 'busy') return { ok: false, fallback: 'absent' };
+        if (rebuilt === undefined) return { ok: false, fallback: 'refused' };
+        g = rebuilt;
+      } else g = r.g;
+    }
+    const cur = e.idx ?? idx;
+    if (g.generation < cur.generation) return { ok: false, fallback: 'stale' };
+    if (g.params.metric !== metric) return { ok: false, fallback: 'metric' };
+    return { ok: true, g, idx: cur };
+  }
+
+  /**
+   * Rebuilds a refused graph from the stored vectors with the stored params, under the writer lock. At most
+   * one rebuild runs per (namespace, HEAD generation) per open store; a rebuild whose result is refused again,
+   * or that cannot be written, drops the index. Returns the loaded graph, undefined when dropped, or 'busy'
+   * when the handle table is full and every other graph is in use (BUG-T2-S6-08): nothing is dropped then, and
+   * the rebuild does not count against the one-per-generation rule.
+   */
+  private async annRebuild(e: Entry, params: AnnParams): Promise<AnnLoaded | undefined | 'busy'> {
+    const st = this.ann.state(e.ns);
+    const gen = e.idx?.generation ?? 0;
+    if (st.rebuiltAt.has(gen)) {
+      await this.annDrop(e.ns);
+      return undefined;
+    }
+    st.rebuiltAt.add(gen);
+    st.rebuilds++;
+    const t0 = this.o.events.start();
+    let outcome = 'ok';
+    const stats = { rows: 0, live: 0, dim: 0, bytes: undefined as number | undefined };
+    try {
+      return await withWebLock(this.lockName(e.ns), async () => {
+        const head = await this.refreshForWrite(e);
+        if (head === undefined) {
+          await this.ann.remove(e.ns);
+          return undefined;
+        }
+        await this.ensure(e, 'full', true);
+        const idx = e.idx!;
+        const kernel = await this.getKernel();
+        // Built in memory first, so that a full handle table with every other graph in use is found out
+        // before any stored record is touched.
+        let handle: number;
+        try {
+          handle = this.ann.build(kernel, idx, e.ns, params, true);
+        } catch (err) {
+          if (err instanceof StorageError && err.details?.['reason'] === 'max_graphs') {
+            outcome = err.code;
+            st.rebuiltAt.delete(gen);
+            st.rebuilds--;
+            return 'busy' as const;
+          }
+          throw err;
+        }
+        try {
+          // The refused records go; the params come from memory (they were validated), the graph is built anew.
+          await st.files.clear();
+          const bytes = this.ann.serialize(kernel, handle);
+          const info = this.ann.info(kernel, handle);
+          stats.rows = info.nodes;
+          stats.live = info.liveNodes;
+          stats.dim = info.dim;
+          this.annQuotaCheck(e.ns, idx, bytes.byteLength);
+          await st.files.putParams(encodeParams(params));
+          await st.files.putGraph(bytes);
+          stats.bytes = bytes.byteLength;
+        } finally {
+          kernel.hnswFree(handle);
+        }
+        // Read back through the validating path: a rebuilt graph is trusted no more than any other.
+        const r = await this.ann.load(e.ns, idx, kernel, true);
+        if (r.kind === 'ok') return r.g;
+        if (r.kind === 'busy') return 'busy' as const;
+        outcome = 'corrupt';
+        await this.annDrop(e.ns);
+        return undefined;
+      });
+    } catch (err) {
+      if (err instanceof KernelTrapError) {
+        outcome = 'io';
+        throw err;
+      }
+      // A rebuild that could not finish (quota, memory, the driver): the index is dropped, the query answers flat.
+      outcome = err instanceof StorageError ? err.code : 'io';
+      await this.annDrop(e.ns).catch(() => undefined);
+      return undefined;
+    } finally {
+      this.o.events.indexBuild(
+        t0,
+        e.ns,
+        outcome,
+        'rebuild',
+        stats.rows,
+        stats.live,
+        stats.dim,
+        params.m,
+        params.efConstruction,
+        stats.bytes,
+      );
+    }
+  }
+
+  /**
+   * Before a write: the graph of the namespace if it is current for the HEAD this write extends, with the
+   * vectors resident so the new rows can be inserted. A refused graph is removed (it would otherwise
+   * look current again once HEAD catches up with a forged generation); a stale or absent one is left alone.
+   */
+  private async annPrepareWrite(
+    e: Entry,
+    idx: OpenIndex | undefined,
+  ): Promise<AnnWrite | undefined> {
+    const st = this.ann.state(e.ns);
+    if (st.status === 'dropped') return undefined;
+    const kernel = await this.getKernel();
+    this.ann.touch(e.ns);
+    let g = st.status === 'loaded' && st.g?.kernel === kernel ? st.g : undefined;
+    if (g === undefined) {
+      const r = await this.ann.load(e.ns, idx, kernel);
+      // Absent, or not loadable right now (every handle in use): the write goes on without a graph update and
+      // the stored graph, left alone, is stale from the new generation on.
+      if (r.kind === 'absent' || r.kind === 'busy') return undefined;
+      if (r.kind !== 'ok') {
+        await this.ann.remove(e.ns);
+        return undefined;
+      }
+      g = r.g;
+    }
+    const headGen = idx?.generation ?? 0;
+    if (g.generation !== headGen) return undefined;
+    if (idx !== undefined) await this.ensure(e, 'full', true);
+    return { g, headGen };
+  }
+
+  /**
+   * After the flat commit: marks the replaced rows' nodes deleted, inserts the new rows, stamps the new HEAD
+   * generation and writes the graph. A failure here leaves the graph on the driver at its old generation,
+   * which makes it stale; the write itself has already succeeded and is not undone.
+   */
+  private async annApplyPut(e: Entry, w: AnnWrite, out: PutOutcome): Promise<void> {
+    if (out.result.written === 0) return;
+    const st = this.ann.state(e.ns);
+    try {
+      // The writer extends the resident index in place when the vectors were resident. When it could not
+      // (the namespace had no index before this call), the committed rows are read back whole.
+      if (e.idx === undefined || !e.idx.vecLoaded) await this.ensure(e, 'full', true);
+      const idx = e.idx;
+      if (idx === undefined || !idx.vecLoaded) throw new AnnRefusedError(0);
+      const kernel = w.g.kernel;
+      let g = w.g;
+      let fresh: number | undefined;
+      if (g.dim !== idx.dim) {
+        // A graph made while the namespace had no dimension: build over every row now.
+        fresh = this.ann.build(kernel, idx, e.ns, g.params);
+      } else {
+        for (const row of out.replacedRows) this.ann.markDeleted(kernel, g, row);
+        this.ann.insert(kernel, idx, g, out.firstNewRow, out.newRows);
+        this.ann.setGeneration(kernel, g, idx.generation);
+      }
+      const handle = fresh ?? g.handle;
+      try {
+        const bytes = this.ann.serialize(kernel, handle);
+        this.annQuotaCheck(e.ns, idx, bytes.byteLength);
+        await st.files.putGraph(bytes);
+        if (fresh !== undefined) {
+          g = this.ann.adopt(e.ns, kernel, fresh, g.params, bytes.byteLength);
+          fresh = undefined;
+        } else {
+          const i = this.ann.info(kernel, handle);
+          g.generation = i.generation;
+          g.nodes = i.nodes;
+          g.liveNodes = i.liveNodes;
+          g.bytes = bytes.byteLength;
+        }
+      } finally {
+        if (fresh !== undefined) kernel.hnswFree(fresh);
+      }
+    } catch (err) {
+      this.annAbandon(e.ns, err);
+    }
+  }
+
+  /** After a delete's flat commit: marks the node deleted and writes the graph at the new generation. */
+  private async annApplyDelete(e: Entry, idx: OpenIndex, row: number | undefined): Promise<void> {
+    const st = this.ann.state(e.ns);
+    try {
+      if (idx.liveRows === 0) {
+        // The last live row went: the graph goes with it.
+        await this.ann.remove(e.ns);
+        return;
+      }
+      if (st.status === 'dropped') return;
+      const kernel = await this.getKernel();
+      this.ann.touch(e.ns);
+      let g = st.status === 'loaded' && st.g?.kernel === kernel ? st.g : undefined;
+      if (g === undefined) {
+        const r = await this.ann.load(e.ns, idx, kernel);
+        if (r.kind === 'absent' || r.kind === 'busy') return;
+        if (r.kind !== 'ok') {
+          await this.ann.remove(e.ns);
+          return;
+        }
+        g = r.g;
+      }
+      if (g.generation !== idx.generation - 1) return; // not current before this delete: it stays stale
+      if (row !== undefined) this.ann.markDeleted(kernel, g, row);
+      this.ann.setGeneration(kernel, g, idx.generation);
+      const bytes = this.ann.serialize(kernel, g.handle);
+      await st.files.putGraph(bytes);
+      const i = this.ann.info(kernel, g.handle);
+      g.generation = i.generation;
+      g.nodes = i.nodes;
+      g.liveNodes = i.liveNodes;
+      g.bytes = bytes.byteLength;
+    } catch (err) {
+      this.annAbandon(e.ns, err);
+    }
+  }
+
+  /** A graph update failed after the flat commit: forget the resident graph (the driver's copy is stale). */
+  private annAbandon(ns: string, err: unknown): void {
+    if (err instanceof KernelTrapError) this.discardKernel();
+    else this.ann.release(ns);
+  }
+
+  /** VectorIndexInfo.ann: the stored graph if it validates (a refused one is not reported, nor repaired here). */
+  private async annInfo(e: Entry, idx: OpenIndex): Promise<AnnIndexInfo | undefined> {
+    const st = this.ann.state(e.ns);
+    if (st.status === 'dropped') return undefined;
+    let g = st.status === 'loaded' && st.g?.kernel === idx.kernel ? st.g : undefined;
+    if (g === undefined) {
+      const r = await this.ann.load(e.ns, idx, idx.kernel);
+      if (r.kind !== 'ok') return undefined;
+      g = r.g;
+    }
+    return {
+      kind: 'hnsw',
+      metric: metricName(g.params.metric),
+      m: g.params.m,
+      efConstruction: g.params.efConstruction,
+      seed: g.params.seed,
+      nodes: g.nodes,
+      liveNodes: g.liveNodes,
+      bytes: g.bytes,
+      generation: g.generation,
+      current: g.generation === idx.generation,
+    };
   }
 
   /** Tombstones the live row of `key`. Resolves false when the namespace has no such row. */
@@ -627,9 +1210,11 @@ export class VectorStore {
           const idx = await this.refreshForWrite(e);
           if (idx === undefined) return false;
           const kernel = await this.getKernel();
+          const row = idx.live.get(key);
           const removed = await tombstoneKey(this.wctx(e, kernel), idx, key);
           wrote = removed;
           rows = idx.liveRows;
+          if (removed && this.annOn) await this.annApplyDelete(e, idx, row);
           return removed;
         });
       });
@@ -649,6 +1234,8 @@ export class VectorStore {
       await this.exclusive(e, () =>
         withWebLock(this.lockName(ns), async () => {
           this.d.refreshIndex?.(e.files.vns);
+          // The graph goes first: with the vectors gone a graph would only be refused later.
+          if (this.annOn) await this.ann.remove(ns);
           e.idx?.dispose();
           e.idx = undefined;
           await e.files.clear();
@@ -664,11 +1251,20 @@ export class VectorStore {
   }
 
   /** Index rows and bytes of one namespace, or undefined (no index, or an index that is corrupt). */
-  protected async usageOne(ns: string): Promise<{ rows: number; bytes: number } | undefined> {
+  protected async usageOne(
+    ns: string,
+  ): Promise<{ rows: number; bytes: number; annBytes?: number } | undefined> {
     const e = this.entry(ns);
     try {
       const idx = await this.exclusive(e, () => this.ensure(e, 'meta', true));
-      return idx ? { rows: idx.liveRows, bytes: idx.bytes } : undefined;
+      // The graph's records, asked of the driver without reading them (0.4.0): counted beside the flat index.
+      const annBytes = this.annOn ? await this.ann.state(ns).files.size() : 0;
+      if (idx) {
+        return annBytes > 0
+          ? { rows: idx.liveRows, bytes: idx.bytes, annBytes }
+          : { rows: idx.liveRows, bytes: idx.bytes };
+      }
+      return annBytes > 0 ? { rows: 0, bytes: 0, annBytes } : undefined;
     } catch (err) {
       if (err instanceof StorageError && err.code === 'corrupt') return undefined;
       throw this.convert(err, ns, false, 'usage');
@@ -679,24 +1275,31 @@ export class VectorStore {
    * Vector usage for one namespace, or summed over every namespace the driver can list (plus the
    * ones this store opened). KV operations and usage never reject because an index is corrupt.
    */
-  async usage(ns?: string): Promise<{ rows: number; bytes: number } | undefined> {
+  async usage(
+    ns?: string,
+  ): Promise<{ rows: number; bytes: number; annBytes?: number } | undefined> {
     if (ns !== undefined) return this.usageOne(ns);
     const names = new Set<string>();
-    for (const n of (await this.d.namespaces?.()) ?? [])
+    for (const n of (await this.d.namespaces?.()) ?? []) {
       if (n.startsWith(this.prefix)) names.add(n.slice(this.prefix.length));
+      if (this.annOn && n.startsWith(ANN_NS_PREFIX)) names.add(n.slice(ANN_NS_PREFIX.length));
+    }
     for (const e of this.entries.values()) if (e.idx !== undefined) names.add(e.ns);
     let rows = 0;
     let bytes = 0;
+    let annBytes = 0;
     let any = false;
     for (const n of names) {
       const u = await this.usageOne(n);
       if (u) {
         rows += u.rows;
         bytes += u.bytes;
+        annBytes += u.annBytes ?? 0;
         any = true;
       }
     }
-    return any ? { rows, bytes } : undefined;
+    if (!any) return undefined;
+    return annBytes > 0 ? { rows, bytes, annBytes } : { rows, bytes };
   }
 
   /** Namespaces this store has a resident index for. */
@@ -708,7 +1311,7 @@ export class VectorStore {
 
   /** Bytes the vector indexes this store has resident hold on the driver (for the soft quota). */
   residentBytes(except?: string): number {
-    let n = 0;
+    let n = this.ann.residentBytes(except);
     for (const e of this.entries.values()) if (e.idx && e.ns !== except) n += e.idx.bytes;
     return n;
   }
@@ -728,13 +1331,9 @@ export class VectorStore {
     return this.kernel?.kind;
   }
 
-  /** Test hook: arm a real trap in the next kernel call. */
-  armTrapForTest(afterCalls = 0): void {
-    this.kernel?.armTrapForTest(afterCalls);
-  }
-
   close(): void {
     this.closed = true;
+    this.ann.dispose();
     for (const e of this.entries.values()) {
       e.idx?.dispose();
       e.idx = undefined;

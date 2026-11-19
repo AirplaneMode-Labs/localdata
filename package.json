@@ -1,7 +1,7 @@
 {
   "name": "@airplanemode/localdata",
-  "version": "0.3.0-alpha.0",
-  "description": "Offline-first browser storage SDK: set/get/delete over OPFS with an IndexedDB fallback, a flat vector index (putVectors/query) with a WebAssembly scan, and a documents API (putDocument/queryChunks/deleteDocument).",
+  "version": "0.4.0-alpha.0",
+  "description": "Offline-first browser storage SDK: set/get/delete over OPFS with an IndexedDB fallback, a flat vector index (putVectors/query) with an optional HNSW graph (buildIndex, query index \"hnsw\") and a WebAssembly scan, and a documents API (putDocument/queryChunks/deleteDocument).",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
@@ -35,6 +35,7 @@
   "keywords": [
     "browser",
     "documents",
+    "hnsw",
     "indexeddb",
     "offline-first",
     "opfs",
@@ -60,7 +61,10 @@
     "bench:vectors": "playwright test -c test/browser/playwright.bench.config.ts vector-bench",
     "bench:readme": "node scripts/bench-readme.mjs --write",
     "bench:documents": "playwright test -c test/browser/playwright.bench.config.ts documents-bench",
-    "bench:docs-readme": "node scripts/bench-docs-readme.mjs --write"
+    "bench:docs-readme": "node scripts/bench-docs-readme.mjs --write",
+    "bench:ann": "playwright test -c test/browser/playwright.bench.config.ts ann-bench",
+    "bench:ann-readme": "node scripts/bench-ann-readme.mjs --write",
+    "bench:delete-cost": "playwright test -c test/browser/playwright.bench.config.ts delete-cost"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
