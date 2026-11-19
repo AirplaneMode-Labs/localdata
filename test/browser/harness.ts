@@ -14,7 +14,11 @@ import {
 } from '../../src/index';
 import { f32Bits, topKRef, type RefRow } from '../../src/vec/reference';
 import {
+  ClusteredStream,
   DIM,
+  clusteredCentres,
+  clusteredPoints,
+  clusteredSet,
   synthKey,
   synthQuery,
   synthRow,
@@ -34,6 +38,7 @@ import {
   type RefChunk,
 } from '../documents.behaviour';
 import { collectPersistCases, type PersistEnv, type PersistResult } from '../persist-env';
+import { annCases, type AnnEnv } from '../ann.behaviour';
 
 type DriverName = 'opfs' | 'indexeddb';
 
@@ -289,6 +294,293 @@ async function runVectorSuite(driver: DriverName): Promise<VectorSuiteResult[]> 
   for (const r of results)
     log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.error ? ` -- ${r.error}` : ''}`);
   return results;
+}
+
+// ---- HNSW (Storage API 0.4.0) ------------------------------------------------------------------------
+
+function annEnvFor(driver: DriverName): AnnEnv {
+  return {
+    makeStore: async (opts) => {
+      await reset(driver);
+      const { wrap: _wrap, ...rest } = opts ?? {};
+      return createStore({ driver, ...rest });
+    },
+    reopen: async (opts) => {
+      const { wrap: _wrap, ...rest } = opts ?? {};
+      return createStore({ driver, ...rest });
+    },
+    raw: async (): Promise<StorageDriver> => {
+      const d = driver === 'opfs' ? new OpfsDriver() : new IndexedDbDriver();
+      await d.open();
+      return d;
+    },
+  };
+}
+
+interface AnnSuiteResult {
+  name: string;
+  ok: boolean;
+  error?: string;
+  ms: number;
+}
+
+async function runAnnSuite(driver: DriverName): Promise<AnnSuiteResult[]> {
+  log(`hnsw suite: ${driver}`);
+  const env = annEnvFor(driver);
+  const out: AnnSuiteResult[] = [];
+  for (const c of annCases) {
+    const t0 = performance.now();
+    try {
+      await c.run(env);
+      out.push({ name: c.name, ok: true, ms: Math.round(performance.now() - t0) });
+    } catch (e) {
+      out.push({
+        name: c.name,
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+        ms: Math.round(performance.now() - t0),
+      });
+    }
+    const r = out[out.length - 1]!;
+    log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.error ? ` -- ${r.error}` : ''}`);
+  }
+  return out;
+}
+
+const ANN_SMOKE = { ns: 'annsmoke', seed: 31, centres: 12, dim: 64 };
+
+/** Browser smoke, step 1: writes rows, builds the graph, queries it, and returns what it answered. */
+async function annPersistWrite(driver: DriverName, rows: number) {
+  await reset(driver);
+  const set = clusteredSet(ANN_SMOKE.seed, ANN_SMOKE.centres, ANN_SMOKE.dim, rows, 8);
+  const store = await createStore({ driver });
+  try {
+    await store.putVectors(
+      ANN_SMOKE.ns,
+      (function* () {
+        for (let i = 0; i < rows; i++)
+          yield {
+            key: `a${i}`,
+            vector: set.rows.slice(i * ANN_SMOKE.dim, (i + 1) * ANN_SMOKE.dim),
+          };
+      })(),
+    );
+    const built = await store.buildIndex(ANN_SMOKE.ns, { kind: 'hnsw', m: 12, efConstruction: 80 });
+    const q = set.queries.slice(0, ANN_SMOKE.dim);
+    const hits = await store.query(ANN_SMOKE.ns, q, 10, { index: 'hnsw', ef: 64, values: false });
+    const flat = await store.query(ANN_SMOKE.ns, q, 10, { values: false });
+    return {
+      built,
+      hnsw: hits.map((h) => h.key),
+      flat: flat.map((h) => h.key),
+      bits: hits.map((h) => Array.from(new Uint32Array(new Float32Array([h.score]).buffer))[0]!),
+    };
+  } finally {
+    await store.close();
+  }
+}
+
+/** Browser smoke, step 2 (after reload or relaunch): the same query from the stored graph. */
+async function annPersistCheck(driver: DriverName, rows: number) {
+  const set = clusteredSet(ANN_SMOKE.seed, ANN_SMOKE.centres, ANN_SMOKE.dim, rows, 8);
+  const events: Event[] = [];
+  const store = await createStore({ driver, events: { emit: (e) => void events.push(e) } });
+  try {
+    const t0 = performance.now();
+    const info = await store.indexInfo(ANN_SMOKE.ns);
+    const q = set.queries.slice(0, ANN_SMOKE.dim);
+    const hits = await store.query(ANN_SMOKE.ns, q, 10, { index: 'hnsw', ef: 64, values: false });
+    const coldMs = Math.round((performance.now() - t0) * 100) / 100;
+    const last = events.filter((e) => e.name === 'storage.query').pop();
+    return {
+      info,
+      hnsw: hits.map((h) => h.key),
+      bits: hits.map((h) => Array.from(new Uint32Array(new Float32Array([h.score]).buffer))[0]!),
+      answeredBy: last?.attrs['index'] ?? null,
+      fallback: last?.attrs['fallback'] ?? null,
+      rebuilds: events.filter(
+        (e) => e.name === 'storage.index.build' && e.attrs['reason'] === 'rebuild',
+      ).length,
+      coldMs,
+    };
+  } finally {
+    await store.close();
+  }
+}
+
+// ---- HNSW benchmark (bench/ann-bench.spec.ts, docs/benchmarks/ann.csv) -----------------------------------
+
+interface AnnBenchData {
+  data: 'clustered' | 'uniform';
+  rows: number;
+  dim: number;
+  centres: number;
+  seed: number;
+}
+const ANN_BENCH_NS = 'annbench';
+
+/** The rows of a benchmark set, one at a time: nothing is held beyond the row being yielded. */
+function annBenchRows(d: AnnBenchData): Generator<{ key: string; vector: Float32Array }> {
+  return (function* () {
+    if (d.data === 'uniform') {
+      for (let i = 0; i < d.rows; i++) yield { key: synthKey(i), vector: synthVector(i, d.dim) };
+      return;
+    }
+    const stream = new ClusteredStream(
+      clusteredCentres(d.seed, d.centres, d.dim),
+      d.dim,
+      d.seed,
+      'data',
+    );
+    for (let i = 0; i < d.rows; i++) {
+      const vector = new Float32Array(d.dim);
+      stream.nextInto(vector);
+      yield { key: synthKey(i), vector };
+    }
+  })();
+}
+
+function annBenchQueries(d: AnnBenchData, count: number): Float32Array[] {
+  if (d.data === 'uniform') return Array.from({ length: count }, (_, j) => synthQuery(j, d.dim));
+  const flat = clusteredPoints(
+    clusteredCentres(d.seed, d.centres, d.dim),
+    d.dim,
+    d.seed,
+    'query',
+    count,
+  );
+  return Array.from({ length: count }, (_, j) => flat.slice(j * d.dim, (j + 1) * d.dim));
+}
+
+/** Step 1 of a run: writes the flat index (timed), then builds the graph (timed). Closes the store. */
+async function annBenchBuild(
+  driver: DriverName,
+  d: AnnBenchData,
+  hnsw: { m: number; efConstruction: number; seed: number },
+  maxIndexBytes: number,
+) {
+  await reset(driver);
+  const store = await createStore({ driver, maxIndexBytes });
+  try {
+    let t0 = performance.now();
+    await store.putVectors(ANN_BENCH_NS, annBenchRows(d));
+    const flatWriteMs = performance.now() - t0;
+    t0 = performance.now();
+    const built = await store.buildIndex(ANN_BENCH_NS, { kind: 'hnsw', ...hnsw });
+    const buildMs = performance.now() - t0;
+    return { flatWriteMs, buildMs, graphBytes: built.bytes, nodes: built.rows };
+  } finally {
+    await store.close();
+  }
+}
+
+/** Step 2, in a fresh page: the cold open and the query latencies of one index kind. */
+async function annBenchCold(
+  driver: DriverName,
+  d: AnnBenchData,
+  kind: 'flat' | 'hnsw',
+  efs: number[],
+  queries: number,
+  maxIndexBytes: number,
+) {
+  const mem = (performance as unknown as HeapMemory).memory;
+  const heap = { peak: mem?.usedJSHeapSize ?? 0 };
+  const sample = () => {
+    const m = (performance as unknown as HeapMemory).memory?.usedJSHeapSize ?? 0;
+    if (m > heap.peak) heap.peak = m;
+  };
+  const timer = setInterval(sample, 10);
+  // The sink only counts which index answered: a graph query that fell back to the flat scan would be a
+  // wrong benchmark row, so the spec refuses any fallback.
+  const answered = { hnsw: 0, flat: 0, fallbacks: 0 };
+  const events = {
+    emit: (e: Event) => {
+      if (e.name !== 'storage.query') return;
+      if (e.attrs['index'] === 'hnsw') answered.hnsw++;
+      else answered.flat++;
+      if (e.attrs['fallback'] !== '') answered.fallbacks++;
+    },
+  };
+  const qs = annBenchQueries(d, queries);
+  const t0 = performance.now();
+  const store = await createStore({ driver, maxIndexBytes, events });
+  const first =
+    kind === 'flat'
+      ? await store.query(ANN_BENCH_NS, qs[0]!, 10, { values: false })
+      : await store.query(ANN_BENCH_NS, qs[0]!, 10, { values: false, index: 'hnsw', ef: efs[0]! });
+  const coldOpenMs = performance.now() - t0;
+  sample();
+  const percentile = (lat: number[], q: number) => {
+    const sorted = [...lat].sort((a, b) => a - b);
+    return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0;
+  };
+  const run = async (ef: number | null) => {
+    const lat: number[] = [];
+    const keys: string[][] = [];
+    for (const q of qs) {
+      const a = performance.now();
+      const hits =
+        ef === null
+          ? await store.query(ANN_BENCH_NS, q, 10, { values: false })
+          : await store.query(ANN_BENCH_NS, q, 10, { values: false, index: 'hnsw', ef });
+      lat.push(performance.now() - a);
+      keys.push(hits.map((h) => h.key));
+      sample();
+    }
+    return { lat, keys };
+  };
+  const variants: Array<{ ef: number | null; p50: number; p95: number; recall: number }> = [];
+  if (kind === 'hnsw') {
+    const results: Array<{ ef: number; lat: number[]; keys: string[][] }> = [];
+    for (const ef of efs) results.push({ ef, ...(await run(ef)) });
+    // Ground truth: the flat scan of the same store, outside the timings above.
+    const truth = (await run(null)).keys;
+    for (const r of results) {
+      let sum = 0;
+      for (let i = 0; i < r.keys.length; i++)
+        sum +=
+          r.keys[i]!.filter((k) => truth[i]!.includes(k)).length / Math.max(1, truth[i]!.length);
+      variants.push({
+        ef: r.ef,
+        p50: percentile(r.lat, 0.5),
+        p95: percentile(r.lat, 0.95),
+        recall: sum / r.keys.length,
+      });
+    }
+  } else {
+    const r = await run(null);
+    variants.push({
+      ef: null,
+      p50: percentile(r.lat, 0.5),
+      p95: percentile(r.lat, 0.95),
+      recall: 1,
+    });
+  }
+  // Memory is read BEFORE indexInfo: indexInfo loads the graph to report it, which would put the graph into
+  // a flat run's WebAssembly memory and heap sample.
+  const wasm = store.vectorWasmBytes();
+  sample();
+  clearInterval(timer);
+  const info = await store.indexInfo(ANN_BENCH_NS);
+  const usage = await store.usage(ANN_BENCH_NS);
+  const kernel = info?.kernel ?? '';
+  await store.close();
+  return {
+    kernel,
+    coldOpenMs,
+    firstHits: first.length,
+    variants,
+    answered,
+    jsHeapPeak: heap.peak,
+    wasmBytes: wasm,
+    indexBytes: info?.bytes ?? 0,
+    annBytes: info?.ann?.bytes ?? 0,
+    annCurrent: info?.ann?.current ?? false,
+    annNodes: info?.ann?.nodes ?? 0,
+    liveRows: info?.rows ?? 0,
+    storageUsage: usage.bytes,
+    precise: mem !== undefined,
+  };
 }
 
 function persistEnvFor(driver: DriverName): PersistEnv {
@@ -1188,6 +1480,56 @@ async function docBenchClear(driver: DriverName) {
   };
 }
 
+// ---- delete cost (bench/delete-cost.ts, docs/benchmarks/delete-cost.csv) --------------------------------
+
+const DELETE_COST_NS = 'delcost';
+
+/**
+ * BUG-T2-S6-13: times `deletes` single delete() calls (one at a time, each awaited) on a namespace of `rows`
+ * seeded vectors, with a current HNSW graph or flat only. Returns the per-delete milliseconds.
+ */
+async function deleteCostBench(
+  driver: DriverName,
+  rows: number,
+  dim: number,
+  withGraph: boolean,
+  deletes: number,
+  hnsw: { m: number; efConstruction: number; seed: number },
+) {
+  await reset(driver);
+  const store = await createStore({ driver, maxIndexBytes: 2 ** 30 });
+  try {
+    await store.putVectors(
+      DELETE_COST_NS,
+      (function* () {
+        for (let i = 0; i < rows; i++) yield { key: synthKey(i), vector: synthVector(i, dim) };
+      })(),
+    );
+    let graphBytes = 0;
+    if (withGraph) {
+      graphBytes = (await store.buildIndex(DELETE_COST_NS, { kind: 'hnsw', ...hnsw })).bytes;
+    }
+    const samples: number[] = [];
+    for (let j = 0; j < deletes; j++) {
+      const key = synthKey((j * 7919 + 1) % rows);
+      const t0 = performance.now();
+      const removed = await store.delete(DELETE_COST_NS, key);
+      samples.push(performance.now() - t0);
+      if (!removed) throw new Error('a delete found no row');
+    }
+    const info = await store.indexInfo(DELETE_COST_NS);
+    return {
+      samples,
+      graphBytes,
+      liveRows: info?.rows ?? 0,
+      kernel: info?.kernel ?? 'none',
+      annCurrent: info?.ann?.current ?? null,
+    };
+  } finally {
+    await store.close();
+  }
+}
+
 const api = {
   ready: true,
   benchBuild,
@@ -1195,6 +1537,12 @@ const api = {
   reset,
   runSuite,
   runVectorSuite,
+  runAnnSuite,
+  annPersistWrite,
+  annPersistCheck,
+  annBenchBuild,
+  annBenchCold,
+  deleteCostBench,
   runQueryCases,
   runProtoCases,
   openForTest: (driver: DriverName) => createStore({ driver }),

@@ -1,7 +1,7 @@
 // D4-06 in installed Chrome (channel "chrome"): the public demo, built as pages.yml builds it (node
 // demo/build.mjs into demo/dist) and served under the Pages sub-path /localdata/ by a server that answers
 // 404 for every other path. Checks: 0 console and page errors, same-origin requests only, the pinned CSP, a
-// build id, the Sprint 5 status line and the not-yet box, and the Documents panel end to end on OPFS and,
+// build id, the Sprint 6 status line and the not-yet box, and the Documents panel end to end on OPFS and,
 // with OPFS removed from the page, on IndexedDB: put 3 documents, query (hits show page references and the
 // storage.doc.* events appear without a docId), delete one, reload and see it gone, clear the namespace and
 // read the browser's own listing.
@@ -82,7 +82,7 @@ async function open(page: Page): Promise<void> {
   await page.waitForSelector('body[data-ready="1"]');
 }
 
-test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a build id, the Sprint 5 status line and the not-yet box', async ({
+test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a build id, the Sprint 6 status line and the not-yet box', async ({
   page,
 }) => {
   const w = watch(page);
@@ -92,7 +92,7 @@ test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a
     .getAttribute('content');
   expect(csp).toBe(CSP);
   const status = (await page.locator('#sprint-status').innerText()).replace(/\s+/g, ' ').trim();
-  expect(status).toMatch(/^Sprint 5 \(18 Nov 2026\): Working: .+\. Not yet: .+\.$/);
+  expect(status).toMatch(/^Sprint 6 \(19 Nov 2026\): Working: .+\. Not yet: .+\.$/);
   expect(status).toContain('not measured on 8 GB');
   const build = (await page.locator('#build-sha').innerText()).trim();
   expect(build).toMatch(
@@ -100,14 +100,16 @@ test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a
   );
   const box = (await page.locator('#not-yet').innerText()).toLowerCase();
   for (const phrase of [
-    'hnsw',
     'quantisation',
     'compaction',
     'encryption at rest',
+    'hnsw for',
+    'querychunks',
     'not measured on 8 gb',
   ])
     expect(box, phrase).toContain(phrase);
   await expect(page.locator('#documents h2')).toHaveText('Documents');
+  await expect(page.locator('#ann h2')).toHaveText('Flat or HNSW, on the same seeded data');
   expect(w.errors).toEqual([]);
   expect(w.foreign).toEqual([]);
   expect(notFound.filter((p) => !p.endsWith('favicon.ico'))).toEqual([]);
@@ -184,6 +186,88 @@ for (const driver of ['opfs', 'indexeddb'] as const) {
     );
     await page.locator('#doc-list').click();
     await expect(page.locator('#doc-status')).toContainText('0 document(s)');
+    expect(w.errors).toEqual([]);
+    expect(w.foreign).toEqual([]);
+  });
+}
+
+for (const driver of ['opfs', 'indexeddb'] as const) {
+  test(`Flat or HNSW panel on ${driver}: build, flip the switch, corrupt the graph, see the refusal and the rebuild`, async ({
+    page,
+  }) => {
+    test.setTimeout(240_000);
+    const w = watch(page);
+    if (driver === 'indexeddb')
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator.storage, 'getDirectory', {
+          value: undefined,
+          configurable: true,
+        });
+      });
+    await open(page);
+    await page.locator('#ann-delete').click();
+    await expect(page.locator('#ann-status')).toContainText('index deleted');
+
+    await page.locator('#ann-build').click();
+    await expect(page.locator('#ann-status')).toContainText(`built 20,000 rows on ${driver}`, {
+      timeout: 180_000,
+    });
+
+    // flat: the exact scan, the page says so
+    await page.locator('#ann-kind').selectOption('flat');
+    await page.locator('#ann-run').click();
+    await expect(page.locator('#ann-status')).toContainText('flat answered 50 queries');
+    await expect(page.locator('#ann-which')).toContainText('flat, answered by flat');
+    await expect(page.locator('#ann-recall')).toContainText('1.000 by definition');
+    await expect(page.locator('#ann-events')).toContainText('none: the graph passed validation');
+
+    // hnsw: the graph answers, the recall is measured against the flat scan in the tab, the graph has bytes
+    await page.locator('#ann-kind').selectOption('hnsw');
+    await page.locator('#ann-run').click();
+    await expect(page.locator('#ann-status')).toContainText('hnsw answered 50 queries');
+    await expect(page.locator('#ann-which')).toContainText('hnsw, answered by hnsw');
+    const recall = Number(
+      /^(\d\.\d{3}) /.exec(await page.locator('#ann-recall').innerText())?.[1] ?? 'NaN',
+    );
+    expect(recall).toBeGreaterThanOrEqual(0.9);
+    expect(recall).toBeLessThanOrEqual(1);
+    const bytes = /\((\d+) bytes\)/.exec(await page.locator('#ann-bytes').innerText());
+    expect(Number(bytes?.[1])).toBeGreaterThan(100_000);
+    const time = (await page.locator('#ann-time').innerText()).match(/[\d.]+ ms/g);
+    expect(time?.length).toBe(2);
+    await expect(page.locator('#ann-build-time')).toContainText('this page load');
+
+    // corrupt only the demo's own graph record, then query: refused, rebuilt, still answered by the graph
+    await page.locator('#ann-corrupt').click();
+    await expect(page.locator('#ann-status')).toContainText(
+      'truncated the graph record of demo-ann',
+    );
+    await page.locator('#ann-run').click();
+    await expect(page.locator('#ann-status')).toContainText('hnsw answered 50 queries', {
+      timeout: 120_000,
+    });
+    await expect(page.locator('#ann-events')).toContainText('graph refused (reason length)');
+    await expect(page.locator('#ann-events')).toContainText('rebuilt from the stored vectors in');
+    await expect(page.locator('#ann-events')).toContainText('(outcome ok)');
+    await expect(page.locator('#ann-which')).toContainText('hnsw, answered by hnsw');
+
+    // the rebuilt graph persisted: after a reload the graph passes validation and answers
+    await page.reload();
+    await page.waitForSelector('body[data-ready="1"]');
+    await page.locator('#ann-kind').selectOption('hnsw');
+    await page.locator('#ann-run').click();
+    await expect(page.locator('#ann-status')).toContainText('hnsw answered 50 queries');
+    await expect(page.locator('#ann-events')).toContainText('none: the graph passed validation');
+    await expect(page.locator('#ann-build-time')).toContainText('built in an earlier page load');
+
+    // the events of this section are listed, and never carry a key
+    const events = await page.locator('#events-list').innerText();
+    expect(events).toContain('storage.query');
+    expect(events).toMatch(/requested='(flat|hnsw)' index='(flat|hnsw)' fallback=''/);
+    for (const leak of ['chunk-0', 'Float32Array']) expect(events.includes(leak)).toBe(false);
+
+    await page.locator('#ann-delete').click();
+    await expect(page.locator('#ann-status')).toContainText('index deleted');
     expect(w.errors).toEqual([]);
     expect(w.foreign).toEqual([]);
   });

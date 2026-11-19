@@ -1,0 +1,17 @@
+{
+  "note": "Written by the native test (LDVEC_WRITE_FIXTURE=1 cargo test -p ldvec --test hnsw). The input is the integer-only generator of crates/ldvec/tests/support/synth.rs and bench/synth.ts; both languages must reproduce both hashes.",
+  "seed": 7,
+  "rows": 2000,
+  "dim": 64,
+  "centres": 20,
+  "m": 16,
+  "efConstruction": 200,
+  "graphSeed": 1,
+  "generation": 1,
+  "metric": "cosine",
+  "ns": "fixture",
+  "inputBytes": 512000,
+  "inputSha256": "940f272b05e4e8e5e7c6d0ebeda68e0148ebe258a5d9ba7d8cd1dd7df3b59dbc",
+  "graphBytes": 159451,
+  "graphSha256": "643ff8cc09c6cb7e8f0295369266970f7137129095971a59054cdd4e76c5fdec"
+}

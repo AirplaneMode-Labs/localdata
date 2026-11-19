@@ -75,6 +75,28 @@ describe('the embedded modules', () => {
     });
   }
 
+  it('both modules export the ten HNSW functions and the size budget holds with them (TD-65: the graph adds 40 to 45 KB)', () => {
+    const NAMES = [
+      'ldv_hnsw_build',
+      'ldv_hnsw_load',
+      'ldv_hnsw_info',
+      'ldv_hnsw_insert',
+      'ldv_hnsw_mark_deleted',
+      'ldv_hnsw_set_generation',
+      'ldv_hnsw_search',
+      'ldv_hnsw_serialize_len',
+      'ldv_hnsw_serialize',
+      'ldv_hnsw_free',
+    ];
+    for (const kind of ['simd', 'scalar'] as const) {
+      const mod = new WebAssembly.Module(readFileSync(wasmPath(kind)));
+      const exported = WebAssembly.Module.exports(mod).map((e) => e.name);
+      for (const n of NAMES) expect(exported, `${kind} exports ${n}`).toContain(n);
+      // The Sprint 5 modules were 34 and 37 KB; the budget (100 KB) is unchanged, not loosened.
+      expect(readFileSync(wasmPath(kind)).length).toBeLessThan(100 * 1024);
+    }
+  });
+
   it('the scalar build contains no 0xFD-prefixed (SIMD) instruction', () => {
     const scan = scanCode(readFileSync(wasmPath('scalar')));
     expect(scan.functions).toBeGreaterThan(5);

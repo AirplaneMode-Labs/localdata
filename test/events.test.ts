@@ -3,7 +3,7 @@
 // repeats the shape and privacy checks over the real drivers.
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   STORAGE_EVENT_NAMES,
   createStore,
@@ -81,7 +81,7 @@ async function make(
 }
 
 describe('storage.* events: shapes', () => {
-  it('exports STORAGE_EVENT_NAMES with the ten names of Event 0.1.4 (seven of 0.1.3 plus storage.doc.*)', () => {
+  it('exports STORAGE_EVENT_NAMES with the eleven names of Event 0.1.5 (ten of 0.1.4 plus storage.index.build)', () => {
     expect([...STORAGE_EVENT_NAMES]).toEqual([
       'storage.set',
       'storage.get',
@@ -93,6 +93,7 @@ describe('storage.* events: shapes', () => {
       'storage.doc.put',
       'storage.doc.delete',
       'storage.doc.query',
+      'storage.index.build',
     ]);
   });
 
@@ -378,12 +379,53 @@ describe('storage.* events: failures', () => {
   });
 });
 
+// S1-120: the strings the privacy test greps the event wire for. Event ids and the session id are
+// random UUIDs, whose characters are [0-9a-f-]; a needle made only of those characters ('c0de') can
+// occur in a random id and fail the test about once in a few hundred runs. Every needle here must
+// contain at least one character outside that alphabet (UUID_ALPHABET_ESCAPE), so no id can match it.
+const UUID_ALPHABET_ESCAPE = /[^0-9a-f-]/;
+const LEAK_VALUE_MARK = 'zz-needle-qx';
+const LEAK_NEEDLES: readonly string[] = [
+  'SENTINEL-KEY',
+  'SENTINEL-PREFIX',
+  'SENTINEL-VALUE',
+  'SENTINEL-DRIVER',
+  LEAK_VALUE_MARK,
+  'slashes',
+  'secret',
+  'disk',
+  'Error:',
+  'at ',
+];
+
+/** Seeded PRNG (mulberry32) for the needle runs: the same 10,000 ids on every machine. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** A v4-shaped id from the seeded PRNG: the same shape randomId() in src/events.ts produces. */
+function seededUuid(rnd: () => number): string {
+  const b = Array.from({ length: 16 }, () => Math.floor(rnd() * 256));
+  b[6] = (b[6]! & 0x0f) | 0x40;
+  b[8] = (b[8]! & 0x3f) | 0x80;
+  const h = b.map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
 describe('storage.* events: privacy', () => {
   const KEY = 'SENTINEL-KEY-7f3a/with/slashes';
   const PREFIX = 'SENTINEL-PREFIX-22b9';
-  const VALUE = 'SENTINEL-VALUE-c0de-नमस्ते';
+  const VALUE = `SENTINEL-VALUE-${LEAK_VALUE_MARK}-नमस्ते`;
 
-  it('no key, prefix, value, driver message or stack appears in any event, over every operation and failure', async () => {
+  /** Every operation and failure path, then the privacy assertions. `fixedId` makes every event id that string. */
+  async function privacyScenario(fixedId?: string): Promise<void> {
     const rec = recorder();
     const driver = new FlakyDriver();
     const store = await make(rec, { quotaBytes: 600 }, driver);
@@ -407,18 +449,8 @@ describe('storage.* events: privacy', () => {
 
     expect(rec.events.length).toBeGreaterThan(10);
     const wire = JSON.stringify(rec.events);
-    for (const needle of [
-      'SENTINEL-KEY',
-      'SENTINEL-PREFIX',
-      'SENTINEL-VALUE',
-      'SENTINEL-DRIVER',
-      'c0de',
-      'slashes',
-      'secret',
-      'disk',
-      'Error:',
-      'at ',
-    ]) {
+    if (fixedId !== undefined) expect(wire).toContain(fixedId);
+    for (const needle of LEAK_NEEDLES) {
       expect(wire, `leaked ${needle}`).not.toContain(needle);
     }
     for (const e of rec.events) {
@@ -427,6 +459,49 @@ describe('storage.* events: privacy', () => {
       ).toBe(true);
     }
     expectValid(rec.events);
+  }
+
+  it('no key, prefix, value, driver message or stack appears in any event, over every operation and failure', async () => {
+    await privacyScenario();
+  });
+
+  it('S1-120: an event id that happens to contain a needle does not fail the privacy check (crafted UUID)', async () => {
+    const crafted = '0000c0de-0000-4000-8000-00000000c0de';
+    const spy = vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(crafted);
+    try {
+      await privacyScenario(crafted);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('S1-120: every needle has a character outside the UUID alphabet [0-9a-f-], so no random id can match it', () => {
+    for (const needle of LEAK_NEEDLES) {
+      expect(needle, `needle ${JSON.stringify(needle)} could occur in a random UUID`).toMatch(
+        UUID_ALPHABET_ESCAPE,
+      );
+    }
+  });
+
+  it('S1-120: 10,000 seeded runs of the needle check give 0 false hits (and the old needle c0de does hit)', () => {
+    const rnd = mulberry32(120);
+    let hits = 0;
+    let oldNeedleHits = 0;
+    for (let run = 0; run < 10_000; run++) {
+      // The two random ids of an event: its own id and the session id.
+      const wire = JSON.stringify({
+        id: seededUuid(rnd),
+        session: seededUuid(rnd),
+        name: 'storage.set',
+      });
+      for (const needle of LEAK_NEEDLES) if (wire.includes(needle)) hits++;
+      if (wire.includes('c0de')) oldNeedleHits++;
+    }
+    expect(
+      oldNeedleHits,
+      'the seeded run must show the old needle was a real hazard',
+    ).toBeGreaterThan(0);
+    expect(hits).toBe(0);
   });
 
   it('only fixed attrs appear: ns, driver, outcome (set/get/delete); driver, ns, usage, quota, needed (quota)', async () => {

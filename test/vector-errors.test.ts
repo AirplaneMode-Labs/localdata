@@ -6,6 +6,7 @@
 //  * a trap discards the kernel instance and the next call works.
 import { afterEach, describe, expect, it } from 'vitest';
 import { MemoryDriver } from '../src/drivers/memory';
+import { armVectorTrap } from '../src/vec/ann-test-hook';
 import { createStore, STORAGE_EVENT_NAMES, type Event, type LocalData } from '../src/index';
 import { DIM, synthQuery, synthRows } from '../bench/synth';
 import { eventProblems } from './event-validate';
@@ -154,12 +155,13 @@ describe('vector error hygiene', () => {
 });
 
 describe('storage.query, storage.index.open and storage.index.write events', () => {
-  it('STORAGE_EVENT_NAMES lists ten names (Event 0.1.4) including the vector ones and storage.doc.*', () => {
+  it('STORAGE_EVENT_NAMES lists eleven names (Event 0.1.5) including the vector ones, storage.doc.* and storage.index.build', () => {
     expect(STORAGE_EVENT_NAMES).toContain('storage.query');
     expect(STORAGE_EVENT_NAMES).toContain('storage.index.open');
     expect(STORAGE_EVENT_NAMES).toContain('storage.index.write');
     expect(STORAGE_EVENT_NAMES).toContain('storage.doc.put');
-    expect(STORAGE_EVENT_NAMES.length).toBe(10);
+    expect(STORAGE_EVENT_NAMES).toContain('storage.index.build');
+    expect(STORAGE_EVENT_NAMES.length).toBe(11);
   });
 
   it('a write, a cold query and a hot query emit the documented events with valid shapes', async () => {
@@ -284,7 +286,7 @@ describe('a WebAssembly trap', () => {
     await store.putVectors(NS, synthRows(0, 200, { dim: 16 }));
     const q = synthQuery(0, 16);
     const before = await store.query(NS, q, 5);
-    store.armVectorTrapForTest(0);
+    armVectorTrap(store, 0);
     const err = await store.query(NS, q, 5).catch((e: unknown) => e);
     expect(err).toMatchObject({ code: 'corrupt', details: { reason: 'wasm_trap' } });
     // not sticky: a trap is not a corrupt index
@@ -297,7 +299,7 @@ describe('a WebAssembly trap', () => {
     const { store } = await make();
     await store.putVectors(NS, synthRows(0, 20, { dim: 16 }));
     await store.query(NS, synthQuery(0, 16), 1);
-    store.armVectorTrapForTest(3);
+    armVectorTrap(store, 3);
     const err = await store
       .putVectors(NS, synthRows(100, 20, { dim: 16 }))
       .catch((e: unknown) => e);
@@ -315,7 +317,7 @@ describe('a WebAssembly trap', () => {
     await driver.open();
     const { store } = await make({}, driver);
     await store.indexInfo(NS);
-    store.armVectorTrapForTest(0);
+    armVectorTrap(store, 0);
     await expect(store.query(NS, synthQuery(0, 16), 3)).rejects.toMatchObject({
       code: 'corrupt',
       details: { reason: 'wasm_trap' },

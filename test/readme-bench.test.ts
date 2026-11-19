@@ -109,25 +109,33 @@ describe('README benchmarks', () => {
     expect(b).toContain('Apple M5 Pro, 48 GB; not measured on 8 GB');
   });
 
-  it('keeps the ten README sections of the Sprint 5 conventions, in order, and no others', () => {
+  it('keeps the README sections of the Sprint 6 conventions, in order, and no others', () => {
     const h2 = [...readme.matchAll(/^## (.+)$/gm)].map((m) => m[1]);
     expect(h2).toEqual([
       'Status',
-      'What it does',
       'Install',
-      'Usage',
+      'Quick start',
+      'How it works',
+      'Contracts',
       'Demo',
       'Benchmarks',
       'Limitations',
-      'Security',
+      'Security and privacy',
+      'Develop',
       'Licence',
-      'Contributing',
     ]);
   });
 
-  it('opens its Status with the Sprint 5 status line (Working: ... Not yet: ...)', () => {
-    const status = readme.slice(readme.indexOf('\n## Status'), readme.indexOf('\n## What it does'));
-    expect(status).toMatch(/\nSprint 5 \(18 Nov 2026\): Working: .+\. Not yet: .+\.\n/);
+  it('opens its Status with the Sprint 6 status line (Working: ... Not yet: ...)', () => {
+    const status = readme.slice(readme.indexOf('\n## Status'), readme.indexOf('\n## Install'));
+    expect(status).toMatch(/\nSprint 6 \(19 Nov 2026\): Working: .+\. Not yet: .+\.\n/);
+    expect(status).toContain('not measured on 8 GB');
+  });
+
+  it('says nothing is published or tagged, and that the names are not reserved', () => {
+    const top = readme.slice(0, readme.indexOf('\n## Status'));
+    expect(top).toContain('Nothing is published and nothing is tagged');
+    expect(top).toContain('not reserved');
   });
 
   it('Limitations states every item the plan requires', () => {
@@ -146,11 +154,17 @@ describe('README benchmarks', () => {
       'not an 8 GB figure',
       'IndexedDB',
       // Sprint 5 (D4-05)
-      'no HNSW',
-      'TD-17',
       'no encryption at rest',
       'deleteDocument hides',
       'only clear(ns) removes',
+      // Sprint 6 (D4-07): the HNSW graph
+      'HNSW is optional and approximate',
+      'no quantisation',
+      'no compaction',
+      'HNSW for documents',
+      'on top of the full-precision vectors',
+      'writes the whole graph',
+      'a graph forged by someone who can write the origin',
     ];
     for (const n of need) expect(lim.toLowerCase(), n).toContain(n.toLowerCase());
   });
