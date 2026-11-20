@@ -1,0 +1,58 @@
+name: Bug report
+description: Something does not work as the README or the docs say it does.
+title: 'bug: '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting. Please **redact** anything private from what you paste below: names, account numbers,
+        file paths, document text. A synthetic or public sample that reproduces the problem is far better than a real one.
+
+        Do **not** report a security problem here. Public issues are not private; follow
+        [SECURITY.md](https://github.com/AirplaneMode-Labs/localdata/blob/main/SECURITY.md) instead.
+  - type: checkboxes
+    id: no-real-documents
+    attributes:
+      label: No real documents
+      description: This project is built for sensitive document workflows, so an issue must never carry one.
+      options:
+        - label: I have not attached any real, confidential or personal document (bank, legal, medical, identity). Any sample is synthetic or public.
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: One short paragraph.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest script or sequence of calls that shows it, with synthetic data.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The `@airplanemode/localdata` version, or the commit of a local build.
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Storage driver
+      options:
+        - OPFS
+        - IndexedDB
+        - memory
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and operating system
+      description: For example, Chrome 157 on Windows 11. Leave empty for Node with the memory driver.

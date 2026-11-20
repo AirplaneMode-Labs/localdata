@@ -7,6 +7,131 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0-alpha.1] - 2026-11-20 (untagged)
+
+Sprint 7 (D4), release readiness. Ids: `D4-0x` are Sprint 7 items; `S1-1xx` are security-consultant findings;
+`BUG-T2-S6-xx` are Sprint 6 tester bugs; `TD-xxx` are team decisions under owner delegation (TD-109 the HNSW duplicate
+fix and the format `LDHNSW02`, TD-110 idle eviction at the cap, TD-111 the stored-params check, TD-112 Dependabot,
+TD-115 the quick-start convention, TD-116 the live demo line, TD-117 issue forms, TD-118 rehearsal artefacts, TD-124 the
+quiet slot for the ANN benchmark, TD-125 the lock-3 pattern of the publish workflows, TD-126 the near-duplicate rule,
+TD-127 no recount of the duplicate statistic at load). Storage API 0.4.1 and Event 0.1.6 are vendored from spec release 0.6.1 in
+runtime/spec; the release tool is vendored from the same release. No runtime dependency was added: `crates/ldvec/Cargo.toml`
+still has an empty `[dependencies]` and `NOTICE` is unchanged. Nothing is tagged or published.
+
+### Added
+
+- Exact-duplicate handling in the HNSW kernel (D4-01, TD-109; BUG-T2-S6-14, S1-124): neighbour selection prunes a
+  candidate whose vector bytes equal an already kept neighbour's, refills free slots from the pruned candidates
+  (keepPrunedConnections), prefers the newest node on a score tie and widens a search whose result list repeats a
+  score. The floors stated before measuring (at ef 64, at least 99 of 100 queries with the flat scan's ten scores and
+  a mean recall@10 by score of at least 0.99) are asserted by `crates/ldvec/tests/hnsw_dup.rs` and
+  `test/ann-duplicates.test.ts` on the uniform probe, clustered boilerplate sets at 10, 50 and 500 copies (dims 32 and 384),
+  1,000 vectors x 10 copies, one vector x 1,000, every row identical and one-ulp near-duplicates.
+- A degenerate-graph rule (TD-109, plan B kept as the second line of defence): a graph whose largest group of identical
+  live rows is larger than `2 * m` (32 at the default `m` 16, the capacity of a layer-0 list) is answered by the exact flat scan, with `fallback: 'duplicates'`.
+  The count (`dupMax`) is in the graph header, counted at build and recounted after every put.
+- The near-duplicate rule (fix round 1, TD-126; BUG-T2-S7-02): synthetic groups of 500 and 1,000 rows one to three
+  ulps apart at dim 384 were answered with 91 to 98 of 100 queries equal to flat and no fallback, because the exact count
+  never saw them. The kernel now also counts the largest group of live rows that share one quantised key (every
+  component's bits with the low 12 mantissa bits cleared, compared by those bytes, never by a hash alone) in the same pass
+  structure, stores it in a new header word (`nearMax`, offset 56; the header is 60 bytes, the format `LDHNSW02` had
+  not shipped), recounts it after every put, and treats a group above `2 * m` of either kind as degenerate. No new event
+  attribute and no new wire string: the existing `duplicates` fallback carries it. Tests first:
+  `crates/ldvec/tests/hnsw_near.rs`, the `t2_*` tests of `hnsw_dup.rs`, and the tight-cluster tests of
+  `test/ann-duplicates.test.ts`. The figures are in `docs/benchmarks/ann-near-duplicates.csv` (recall only, native, written by
+  the ignored test `near_duplicate_figures`): every `t2_*` set is degenerate, so the flat scan answers. It is a proxy measured on synthetic sets: wider tight clusters (a relative
+  spread of 1e-4 or more per component) are not detected and the graph alone can return scores below the flat scan's there, see the
+  README's Limitations. The determinism fixture was re-pinned for the 4 header bytes; the graph structure is unchanged.
+- `storage.index.build` carries `duplicateRows` (Event 0.1.6), the live rows whose vector bytes equal an earlier live
+  row's, counted in the kernel (`ldv_hnsw_dup_stats`, eight transient bytes per live row).
+- The graph format `LDHNSW02`; a graph file of `LDHNSW01` is refused with reason `version` and rebuilt from the stored
+  vectors at most once per HEAD generation, guarded by a persisted `rebuilt` marker; the rebuild goes through the same
+  quota, `maxIndexBytes` and WebAssembly memory refusals as a fresh build. (D4-01)
+- `docs/benchmarks/ann-duplicates.csv` and its README block: HNSW at 100,000 x 384 with every vector stored 30 times (the graph
+  answers) and 60 times (degenerate: the flat scan answers), recall counted by score. `host_load_1m_start` and `host_load_1m_end` are the last columns of `ann.csv` and
+  `ann-duplicates.csv` (empty on Windows); a row measured under a load above 4 says so in its latency cells. (D4-03,
+  TD-124)
+- The release path (B1, B2, B4; TD-103 to TD-106, TD-118, TD-123): `scripts/release/rehearse.mjs` and the CI job
+  `release-rehearsal (<os>)` (clean install of the packed tarball into a fresh directory on Linux, macOS and Windows,
+  asserted calls on the memory backend including an HNSW query, then a `localdata-rehearsal` manifest signed with the
+  published RFC 8032 TEST 1 key, verified with the explicit flags, and the refusal proofs by exact exit code and first
+  stderr line, with a self-test that turns red against a missing, lying or signalled tool); the vendored release tool
+  and the 36 shared release vectors through it (`test/release-vectors.test.ts`); `.github/workflows/publish.yml`
+  (owner-only, `workflow_dispatch` only, six locks, three bindings, provenance; never run) and its policy test;
+  `docs/RELEASING.md` (the owner's steps only), `docs/release-keys.json` (`keys: []`) and the rows of `docs/release.md`.
+  (D4-04, D4-05)
+- README: `Live demo:` line in the first lines and a "Try it in two minutes" section whose blocks are executed by
+  `test/quickstart.test.ts` from the built tarball in a fresh directory (no model download, no test key). Issue forms with
+  a required no-real-documents checkbox, a `SECURITY.md` contact link, and a CONTRIBUTING update. (D4-06, TD-115 to
+  TD-117)
+- Demo: data choices for the HNSW panel (20,000 distinct rows, every vector stored 20 times, one vector stored 300
+  times), the duplicate-row count, an "old-format file" action, and a refreshed not-yet box. (D4-07)
+
+### Changed
+
+- `buildIndex` at the 64-graph cap releases the in-memory instance of the least recently used idle graph instead of
+  throwing; `max_graphs` only when every resident graph is busy. `dropIndex` frees a slot only if the graph was
+  resident. README, `docs/vector-index.md` and `test/ann-docs.test.ts` say the same (D4-02, TD-110; BUG-T2-S6-15,
+  S1-125).
+- The ann benchmark was run again on the new format, in quiet slot Q2 (the 1,000,000-row row finished inside its 20-minute box);
+  the `README.md` blocks are regenerated from `docs/benchmarks/ann.csv` and `ann-duplicates.csv`. Every Sprint 6 row is kept,
+  unchanged and not re-measured, in `docs/benchmarks/ann-s6-format-v1.csv` (format `LDHNSW01`) (D4-03, TD-124).
+- Version 0.4.0-alpha.1. `sync-contracts` also reads the spec release's `LANDED.json`.
+- README, "Try it in two minutes": the setup block needs the network once (the npm registry for `npm ci`, and rustup when the
+  toolchain is missing); the install and run blocks run offline. It said "no network is used after the clone", which was not
+  true of the setup block (BUG-T1-S7-02). The Status line and the demo page word the duplicate claim as the measured floor
+  (BUG-T1-S7-04). `test/quickstart.test.ts` runs its static pre-check before any block is written or executed (BUG-T3-S7-06).
+- `publish.yml` follows the TD-125 lock-3 pattern, regenerated from runtime's (fix round 1; BUG-T3-S7-02, S1-130 to S1-132, S1-135):
+  no `vars.` in any job-level `if`, the arming variable and `RELEASE_KEY_ID` are variables of the `release` environment read
+  only in step env, the arming step is the first step after checkout, `persist-credentials: false` on every checkout, a refusal
+  of a manifest that carries `expiresAt`, a strict SemVer check before `GITHUB_ENV`, `npm publish "./$TARBALL"`, and the
+  tag-to-commit binding in `scripts/release/publish-guard.mjs` (`test/publish-guard.test.ts`). `test/workflows-release.test.ts`
+  pins each rule and each has a mutation proof. The vendored release tool and `src/contracts/event.ts` were re-vendored from
+  the re-landed spec 0.6.1 (comment text and tool fixes only; the 31 release vectors are unchanged).
+  `docs/RELEASING.md` has the owner's steps in the single-run order (dispatch, check the candidate, sign, arm just before
+  approving, disarm after) and compares the candidate tarball's digest with an independent build of the same commit before
+  signing, not only `gh run view` metadata.
+- `.gitignore` no longer hides the five vendored release vectors' `release-manifest.json` (BUG-T2-S7-01): a clean checkout
+  failed `test/release-vectors.test.ts` and `test/quickstart.test.ts` without them.
+
+### Fixed
+
+- Fix round 2, documentation and a test only; no kernel, rule or graph-format change (the measured recall-probe rule is
+  Sprint 8). BUG-T2-S7-07: `docs/benchmarks/ann-near-duplicates.csv` gains eight all-component float-noise rows
+  (`noise`: +-256 and +-1024 ulp, relative Gaussian 1e-5 and 1e-4, dims 32 and 384, 30 x 500, `ef` 64; written by the ignored
+  test `near_duplicate_figures` with `LDVEC_WRITE_NEAR_CSV=1`). On the synthetic dim-384 set none was detected and the graph
+  alone answered 99, 95, 96 and 92 of 100 queries equal to flat; at dim 32 the first three were detected. The README
+  Limitations, `docs/vector-index.md`, `docs/hnsw-format.md` and the write-up draft now say that detection depends on the data
+  and the dimension, quote those rows and scope the earlier "1e-5 and 1e-6 gave 100 of 100" to the one set it was measured
+  on; the flat scan is the way to complete answers. BUG-T2-S7-09: the docs state that while a graph is resident every
+  `putVectors` recounts all live rows (two hashing passes and a sort), a cost linear in the row count, with no figure
+  quoted. BUG-T1-S7-12, BUG-T2-S7-08: no public prose names a tester role as the subject of a claim
+  (`test/ann-docs.test.ts` pins it). The Q2 latency cells stay labelled "measured under load".
+- BUG-T2-S6-14 / S1-124 (above), BUG-T2-S6-15 / S1-125 (above), and the README's internal tester label is gone.
+- S1-123 / S1-128 (D4-02, TD-111): `Graph::load` takes the stored params record and compares the header with it, and with
+  every limit, before anything sized by a header field is reserved. A forged header with `m` 64 over a namespace built
+  with `m` 16 and a declared million nodes used to make the kernel reserve and zero-fill 516 MB; under a counting
+  allocator (`crates/ldvec/tests/hnsw_header.rs`) the same file is now refused with no allocation at all (reason
+  `params`).
+
+### Security
+
+- The stored-params comparison above, the allocation-probe tests, and two header words for the duplicate bounds that the
+  loader checks (`dupMax` and `nearMax`: each at most the node count, `nearMax` at least `dupMax`). A forged RAISED bound
+  can only force the exact flat path; a forged or lowered bound (kept consistent) can suppress the `duplicates` fallback,
+  which costs recall only and never a score: the statistic is not recounted at load (TD-127, S1-134, BUG-T2-S7-03), and the
+  forger needs write access to the origin's storage, which already allows replacing the vectors.
+- Release rehearsal without a real key: the test key signs only a `-rehearsal` id, `--allow-test-key` exists only on the
+  command line, `docs/release-keys.json` trusts nothing until the owner adds the key, and the publish workflow has no
+  trigger but `workflow_dispatch`, no `pull_request_target`, no `inputs`, secrets only in the step env of the publish
+  step, and `id-token` and `attestations` only in the publish job.
+
+### Deferred
+
+- Batched delete, compaction, quantisation, encryption at rest and HNSW for `queryChunks` (TD-96): none of them closes a tag
+  blocker. Reserving the npm scope, the real key, the `release` environment, tagging and publishing are the owner's
+  (`docs/RELEASING.md`). The 8 GB laptop figure is the owner's: every 8 GB cell still reads "not measured on 8 GB".
+
 ## [0.4.0-alpha.0] - 2026-11-19 (untagged)
 
 Sprint 6 (D4). Ids: `D4-0x` are Sprint 6 items; `S1-1xx` are security-consultant findings; `TD-xx` are team
@@ -388,7 +513,7 @@ spec release 0.4.0 in runtime/spec (committed; public after the owner's push).
   copied, counts are range-checked before they size anything, arithmetic is checked `u64`, the whole index is
   checked against `maxIndexBytes` before any block is allocated, WebAssembly memory only grows after a part
   has the length the HEAD implies, and a 200,000-iteration SplitMix64 mutation harness plus a differential
-  validator check the kernel's parsers (T2 runs 1,000,000 native and 10,000 WebAssembly cases). A trap
+  validator check the kernel's parsers (a 1,000,000-case native run and a 10,000-case WebAssembly run were made). A trap
   discards the instance. (D4-02, D4-03)
 - Builder paths: both embedded modules are built with `--remap-path-prefix` for the repository, the cargo
   home and the rustup home, release profile `debug = false`, `strip = true`; `test/builder-paths.test.ts` and

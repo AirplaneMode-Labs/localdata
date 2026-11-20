@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a change or an addition.
+title: 'feature: '
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository implements a fixed contract (Storage API, vendored from the `runtime` repository). A request that
+        changes the contract belongs in `runtime` first. Do not report a security problem here; see
+        [SECURITY.md](https://github.com/AirplaneMode-Labs/localdata/blob/main/SECURITY.md).
+  - type: checkboxes
+    id: no-real-documents
+    attributes:
+      label: No real documents
+      options:
+        - label: I have not attached any real, confidential or personal document (bank, legal, medical, identity). Any sample is synthetic or public.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do, and what stops you?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you change?
+      description: Name the file or the call if you know it.

@@ -2,7 +2,9 @@
 
 ## Reporting a vulnerability
 
-Email jtushar53@gmail.com with a description of the issue, steps to reproduce, and the affected
+Report a vulnerability **privately and never in a public issue**: a public issue discloses it to everyone at once. Use
+GitHub's private vulnerability reporting for this repository if it is enabled (the owner's step), or email
+jtushar53@gmail.com with a description of the issue, steps to reproduce, and the affected
 version or commit. You will receive an acknowledgement within 7 days.
 
 We follow a 90-day coordinated disclosure window: we ask reporters to withhold public details for

@@ -18,6 +18,26 @@ open-core, offline-first, browser-native AI infrastructure lab.
 - Run `npm run ci` (format check, typecheck, unit tests, build) and `npm run test:browser` (Playwright
   on installed Chrome) before opening a pull request.
 
+## No real documents
+
+This library is built for sensitive document workflows, so nothing in an issue, a pull request, a test or a benchmark
+may be a real document (bank, legal, medical, identity) or anything derived from one. Inputs are synthetic (the
+integer-only generator of `bench/synth.ts`, hand-written vectors) or clearly public and openly licensed, with the
+licence recorded; no committed input is over 5 MB.
+
+## Before you open a pull request
+
+- `npm run ci` (build of the WebAssembly kernel, format check, typecheck, unit tests, build), and
+  `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked`
+  and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` when you touch `crates/ldvec`.
+- The README section "Try it in two minutes" is executed by `test/quickstart.test.ts`: if you change what it shows, the
+  test shows you what to update. Benchmark blocks in the README are generated from `docs/benchmarks/*.csv`
+  (`npm run bench:readme`, `npm run bench:ann-readme`); never edit a figure by hand.
+- The release path is rehearsed, never run, by `node scripts/release/rehearse.mjs` (it signs with the published RFC
+  8032 test key and publishes nothing). Releasing is the owner's: see `docs/RELEASING.md`. A pull request does not tag,
+  publish, change a repository setting or touch `docs/release-keys.json`.
+- Good first issues are drafted in the Airplane Mode Labs workspace; if one is filed here it names the file to start in.
+
 ## Licence of contributions
 
 By contributing you agree that your contributions are licensed under the Apache License, Version 2.0,
