@@ -16,7 +16,8 @@ the registry, in that order.
 1. **Review the candidate commit and decide to release.** Read the diff since the last reviewed commit, the CHANGELOG
    entry for `0.4.0-alpha.1`, `docs/release.md` and the benchmark section of the README. The definition of done also has
    a row for the 8 GB Windows laptop benchmark (`npm run bench:vectors`, `npm run bench:documents`, `npm run bench:ann`
-   there); it is the owner's. Why not the team: a release is a decision, and the 8 GB laptop is the owner's.
+   there); it is the owner's. Commit what those runs write (the CSV rows under `docs/benchmarks/`, with the machine named
+   in the index there) before any README 8 GB cell is filled: a figure without its committed row is not done. Why not the team: a release is a decision, and the 8 GB laptop is the owner's.
 
 2. **Reserve the npm scope.** Create the npm organisation `airplanemode` (or the scope you choose; then change the name in
    `package.json`, the README and `publish.yml`, all of which say `@airplanemode/localdata`). Why not the team: registry

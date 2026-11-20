@@ -57,6 +57,9 @@ the page, and times a cold `createStore` plus first `query(k = 10)` in fresh pag
 after relaunching Chrome on the same profile, then fifty more queries for p50 and p95. Chrome runs with
 `--enable-precise-memory-info`. The CSV's `commit` is `git describe --always --dirty`, its `machine` is
 generated from `os.cpus()` and `os.totalmem()`, and nothing in it or in the README numbers is typed by hand.
+Every raw file, its date, commit, machine and the command that reproduces it are indexed in
+[benchmarks/README.md](benchmarks/README.md); the sizes of the two WebAssembly modules, against the 100 KB budget of
+section 2, are recorded the same way in `docs/benchmarks/wasm-size.csv`.
 
 Not measured: anything on an 8 GB Windows no-GPU laptop (the owner's step: the same command there), the
 effect of Windows Defender on OPFS and IndexedDB files, behaviour under memory pressure, and the OS file
@@ -114,10 +117,10 @@ flat scan (`fallback: 'refused'`) until `buildIndex` is called again: there is n
 In Sprint 6 a graph built over them could answer a full `k` hits whose scores sat below the flat scan's, with no
 fallback in the event: the reproduction (5 groups of 80 copies and 100 distinct rows, dim 8) had 13 of 100
 queries equal to flat, and `crates/ldvec/tests/hnsw_dup.rs` gives 13 of 100 again for 5 groups of 50 copies
-and 100 distinct rows (dim 32, clustered) when it is run against the Sprint 6 kernel. The root cause is in the kernel's neighbour selection: copies of one vector tie with each other, the diversity
+and 100 distinct rows (dim 32, clustered) when it is run against the Sprint 6 kernel (raw data not kept: that kernel is no longer in the tree). The root cause is in the kernel's neighbour selection: copies of one vector tie with each other, the diversity
 heuristic accepted every tie, so once the copies outnumbered `m` they filled every neighbour list of the group
 and the group became an island, unreachable from the rest of the graph (on that data the walk from the entry
-point reached 33 of 350 nodes). Copies also each take a slot of the `ef` result list, so `ef` slots held far
+point reached 33 of 350 nodes; raw data not kept). Copies also each take a slot of the `ef` result list, so `ef` slots held far
 fewer than `ef` distinct vectors. Format `LDHNSW02` fixes it in four ways, all in the kernel and all
 deterministic: (1) a candidate whose vector bytes equal an already kept neighbour's is pruned even on a tie,
 comparing the bytes themselves and never a hash; (2) free slots are refilled from the pruned candidates in score
@@ -214,5 +217,5 @@ about 6.3 hours. Puts do batch (one `putVectors` call writes the graph once). No
 
 **What is not built.** Quantisation, compaction (deleted and replaced nodes stay until `buildIndex` replaces
 the graph), encryption at rest, HNSW for `queryChunks`, a graph shared between namespaces, an incremental
-write of the graph (every change that keeps a graph current writes the whole record again, about 10 MB at
+write of the graph (every change that keeps a graph current writes the whole record again, about 12 MB at
 100,000 rows), a batched delete, and any parallel build.

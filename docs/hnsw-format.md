@@ -98,7 +98,7 @@ reserved before the header's `m`, `efConstruction`, metric and seed have been co
 record the host passes in (`ldv_hnsw_load` takes them as arguments): a forged `m = 64` over a namespace built
 with `m = 16` and a declared million nodes is refused at that comparison, with no allocation at all
 (`crates/ldvec/tests/hnsw_header.rs` runs it under a counting allocator: the largest request is 0 bytes;
-Sprint 6 reserved 516 MB for the same file). Accidental corruption is therefore reported as `crc`; a graph
+Sprint 6 reserved 516 MB for the same file: 1,000,000 nodes x 129 words x 4 bytes of layer 0 at m = 64, arithmetic on the forged header). Accidental corruption is therefore reported as `crc`; a graph
 that was crafted with a valid CRC is caught by the structural checks. Cycles are legal and harmless (search
 keeps a visited set bounded by nodeCount), and duplicate links inside one list are legal.
 

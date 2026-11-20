@@ -7,6 +7,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Owner decision, 20 Nov 2026: every benchmark that is run is published in the repository it measures, and a figure quoted
+anywhere without its committed raw file is not done. Documents, tests and benchmark scripts only: no change to the
+library, the kernel or the graph format, so the published surface (`dist/index.js`) is unchanged.
+
+### Added
+
+- `docs/benchmarks/README.md`, the index of the raw results: every file of `docs/benchmarks/` with its status (current,
+  or a historical baseline from an earlier build), date, commit and machine, what it measures, how it was measured, the
+  exact command that reproduces it (or why it cannot be reproduced), and where it is quoted. It carries the standing line
+  that nothing in the folder was measured on an 8 GB laptop, and a section listing the few quoted figures whose raw
+  data was not kept.
+- `docs/benchmarks/ann-scale-duplicates-native.csv`, written by the new ignored test `scale_duplicate_figures` in
+  `crates/ldvec/tests/hnsw_dup.rs`: the 100,000 x 384 duplicate sets at 30 and 60 copies of every vector, built natively
+  at ef 32, 64 and 128, recall only. It bears out the figures that the README, the write-up draft and `docs/vector-index.md`
+  already quoted for the 2m boundary and that had no committed row (the kernel and the rule are unchanged).
+- `docs/benchmarks/wasm-size.csv`, written by `npm run bench:wasm-size` (`scripts/bench-wasm-size.mjs`): the size and
+  sha256 of the two embedded WebAssembly modules against the 100 KiB budget that `test/ldvec-wasm.test.ts` asserts, the
+  row behind "under 100 KB".
+- `scripts/bench-figures.mjs` and `test/benchmarks-index.test.ts`: the rule as a test. Every file of the folder is in the
+  index with the date, commit and machine of its own rows and a reproduce command that exists; every measured figure of
+  the README (outside its generated blocks), the CHANGELOG, `docs/*.md`, the demo page and the benchmark generators is
+  computed from a committed row, is a stated floor or constant, is arithmetic on stated inputs, or is marked "raw data
+  not kept" beside it and listed in the index; any other figure fails the test, and so does a row that no longer bears a
+  figure out. The test also breaks each rule on a copy of the inputs to show that it fails.
+- `--check` (and `--readme <file>`) on `scripts/bench-readme.mjs`, `scripts/bench-docs-readme.mjs` and
+  `scripts/bench-ann-readme.mjs`: exit 1 when a README benchmark block differs from what its CSV generates.
+  `npm run bench:check` runs them, the wasm size check and `scripts/bench-figures.mjs`.
+
+### Changed
+
+- The README Benchmarks section links `docs/benchmarks/` and its index, the Develop section lists the commands that write
+  or check the raw files, and the demo page links the folder on GitHub (a plain link in the header and the footer; the
+  status line and the content security policy are unchanged).
+- Figures that have no raw file now say so where they are quoted: the cost of the second counting pass, the Sprint 6
+  duplicate reproduction, the one `top` sample in the write-up draft, and the Sprint 4 JS heap probe of the README memory
+  budget, which no longer cites a path outside this repository. None was re-created.
+- Two figures were corrected to match their files: the size of the graph record in the README and in
+  `docs/vector-index.md` (it was rounded down by a megabyte or two; it now reads `ann.csv` to the nearest MB), and the
+  lowest host load in the write-up draft (it now matches the README: the lowest of the start and the end columns).
+- `docs/RELEASING.md` step 1 tells the owner to commit the rows of the 8 GB runs under `docs/benchmarks/` before any
+  README 8 GB cell is filled.
+
 ## [0.4.0-alpha.1] - 2026-11-20 (untagged)
 
 Sprint 7 (D4), release readiness. Ids: `D4-0x` are Sprint 7 items; `S1-1xx` are security-consultant findings;
