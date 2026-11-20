@@ -53,18 +53,18 @@ function fixture(): { specDir: string; outDir: string; landed: Map<string, strin
 }
 
 describe('vendored contracts', () => {
-  it('vendor storage-api.ts @ 0.4.0 and event.ts @ 0.1.5, each with its own version header', () => {
-    expect(CONTRACT_VERSIONS).toEqual({ 'storage-api.ts': '0.4.0', 'event.ts': '0.1.5' });
+  it('vendor storage-api.ts @ 0.4.1 and event.ts @ 0.1.6 (spec release 0.6.1), each with its own version header', () => {
+    expect(CONTRACT_VERSIONS).toEqual({ 'storage-api.ts': '0.4.1', 'event.ts': '0.1.6' });
     expect(CONTRACTS.map((c: { target: string }) => c.target.split(/[\\/]/).pop())).toEqual([
       'storage-api.ts',
       'event.ts',
     ]);
     const headers = (CONTRACTS as Array<{ header: string }>).map((c) => c.header);
     expect(headers[0]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.4.0; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.4.1; source of truth is runtime/spec; do not edit here\n',
     );
     expect(headers[1]).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.5; source of truth is runtime/spec; do not edit here\n',
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.6; source of truth is runtime/spec; do not edit here\n',
     );
   });
 
@@ -118,17 +118,33 @@ describe('parseLanded', () => {
   });
 });
 
+describe('parseLanded reads LANDED.json (spec release 0.6.1)', () => {
+  it('maps spec/<path> to its sha256 and ignores anything that is not a 64-hex digest', () => {
+    const a = 'a'.repeat(64);
+    const map = parseLanded(
+      JSON.stringify({
+        specRelease: '0.6.1',
+        files: { 'spec/storage-api.ts': a, 'spec/event.ts': 'nope', 'spec/vectors/README.md': a },
+      }),
+    );
+    expect(map.get('storage-api.ts')).toBe(a);
+    expect(map.get('vectors/README.md')).toBe(a);
+    expect(map.has('event.ts')).toBe(false);
+    expect(parseLanded('{"files": 3}').size).toBe(0);
+  });
+});
+
 describe('sync() gated on SPEC-LANDED.txt', () => {
   it('copies both contracts with their headers when every sha256 matches, then reports in-sync', () => {
     const { specDir, outDir, landed } = fixture();
     const first = sync({ specDir, outDir, landed });
     expect(first.map((r: { status: string }) => r.status)).toEqual(['updated', 'updated']);
     expect(readFileSync(join(outDir, 'storage-api.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.4.0; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/storage-api.ts @ 0.4.1; source of truth is runtime/spec; do not edit here\n' +
         STORAGE_SRC,
     );
     expect(readFileSync(join(outDir, 'event.ts'), 'utf8')).toBe(
-      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.5; source of truth is runtime/spec; do not edit here\n' +
+      '// Vendored from AirplaneMode-Labs/runtime spec/event.ts @ 0.1.6; source of truth is runtime/spec; do not edit here\n' +
         EVENT_SRC,
     );
     const second = sync({ specDir, outDir, landed });

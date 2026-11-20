@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Copies the two contracts localdata vendors from the sibling runtime repository (../runtime/spec)
-// into src/contracts/, prepending the vendoring header: storage-api.ts @ 0.4.0 and event.ts @ 0.1.5.
+// into src/contracts/, prepending the vendoring header: storage-api.ts @ 0.4.1 and event.ts @ 0.1.6 (spec release 0.6.1).
 // The source of truth is runtime/spec; never edit a vendored copy by hand.
 //
-// The copy is gated on the spec release's SPEC-LANDED.txt (one `sha256  path` line per spec file):
+// The copy is gated on the spec release's SPEC-LANDED.txt (one `sha256  path` line per spec file), or on its
+// LANDED.json (spec release 0.6.1 writes one: { files: { "spec/<path>": "<sha256>" } }):
 // every source file must hash to its recorded value, otherwise NOTHING is copied. SPEC-LANDED.txt is
 // looked up in this order, the same order dockit uses:
 //   1. the SPEC_LANDED environment variable (a path; if set and missing, that is an error);
@@ -32,8 +33,8 @@ export const DEFAULT_OUT_DIR = resolve(repo, 'src', 'contracts');
 // Each contract carries its own version (spec release 0.5.0): the header names that contract's
 // version, not the release's.
 export const CONTRACT_VERSIONS = {
-  'storage-api.ts': '0.4.0',
-  'event.ts': '0.1.5',
+  'storage-api.ts': '0.4.1',
+  'event.ts': '0.1.6',
 };
 export const CONTRACT_FILES = Object.keys(CONTRACT_VERSIONS);
 
@@ -64,6 +65,15 @@ export function vendoredBody(text) {
  */
 export function parseLanded(text) {
   const map = new Map();
+  // spec release 0.6.1: LANDED.json, { files: { "spec/<path>": "<sha256>" } }
+  if (text.trimStart().startsWith('{')) {
+    const files = JSON.parse(text)?.files;
+    if (files !== null && typeof files === 'object')
+      for (const [path, digest] of Object.entries(files))
+        if (typeof digest === 'string' && /^[0-9a-f]{64}$/u.test(digest))
+          map.set(path.replace(/^\.\//u, '').replace(/^spec\//u, ''), digest);
+    return map;
+  }
   for (const line of text.split('\n')) {
     const m = /^([0-9a-f]{64})\s+\*?(.+?)\s*$/u.exec(line.trim());
     if (m) map.set(m[2].replace(/^\.\//u, '').replace(/^spec\//u, ''), m[1]);
