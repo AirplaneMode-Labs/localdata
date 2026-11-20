@@ -3,6 +3,8 @@
 // parser, and the one function that turns CSV rows into the README benchmark section. Nothing in the
 // README numbers is typed by hand: they are computed here from the CSV and nothing else.
 
+import { join, resolve } from 'node:path';
+
 export const COLUMNS = [
   'commit',
   'date_utc',
@@ -71,6 +73,29 @@ export function parseCsv(text) {
   const [head, ...body] = rows;
   if (!head) return [];
   return body.map((r) => Object.fromEntries(head.map((h, i) => [h, r[i] ?? ''])));
+}
+
+/** The path after `--readme` on the command line, else the README.md of the repository: the --check modes of the
+ * generators read it, so a test can point them at a copy that was edited by hand. */
+export function readmePath(argv, repo) {
+  const i = argv.indexOf('--readme');
+  return i >= 0 && argv[i + 1] ? resolve(argv[i + 1]) : join(repo, 'README.md');
+}
+
+/**
+ * Whether the block of `text` between `begin` and `end` is exactly `body`, as `--write` writes it. `name` is the marker
+ * name for the message. Returns `{ ok, message }`.
+ */
+export function checkBlock(text, begin, end, body, name) {
+  const a = text.indexOf(begin);
+  const b = text.indexOf(end);
+  if (a < 0 || b < a) return { ok: false, message: `README.md has no ${name} markers` };
+  if (text.slice(a, b) === `${begin}\n\n${body}\n\n`)
+    return { ok: true, message: `README.md ${name} block is up to date with the CSV` };
+  return {
+    ok: false,
+    message: `README.md ${name} block differs from the CSV: a figure was edited by hand or the CSV changed; run the generator with --write`,
+  };
 }
 
 const num = (v) => Number(v);
@@ -184,7 +209,7 @@ export function renderBench(rows) {
   }
   lines.push('');
   lines.push(
-    "Memory budget (median / worst over the cold runs). `index bytes` is the index as written (HEAD, vectors, META with keys, value parts); `WASM memory` is the kernel instance's linear memory after the first query; `JS heap peak` is `performance.memory.usedJSHeapSize` sampled every 10 ms (approximate) over the first query plus the 50 queries that follow it, so it depends on GC timing and is not a cold-window peak (a Sprint 4 browser probe read about 79.2 MB at the end of the first query on the 256-byte index and 163.8 MB after 50 more queries: `evidence/sprint-4/T1/results/heap-probe-cs256.json`); `storage usage` is `navigator.storage.estimate().usage` for the whole origin:",
+    "Memory budget (median / worst over the cold runs). `index bytes` is the index as written (HEAD, vectors, META with keys, value parts); `WASM memory` is the kernel instance's linear memory after the first query; `JS heap peak` is `performance.memory.usedJSHeapSize` sampled every 10 ms (approximate) over the first query plus the 50 queries that follow it, so it depends on GC timing and is not a cold-window peak (a Sprint 4 browser probe read about 79.2 MB at the end of the first query on the 256-byte index and 163.8 MB after 50 more queries; raw data not kept, the probe output is not in this repository); `storage usage` is `navigator.storage.estimate().usage` for the whole origin:",
   );
   lines.push('');
   lines.push(

@@ -934,19 +934,13 @@ fn rows_that_differ_only_in_the_sign_of_zero_are_not_byte_duplicates() {
     assert_ne!(a, b, "the two vectors differ in their bytes");
 }
 
-/// The bench's data set (docs/benchmarks/ann-duplicates.csv): 100,000 x 384, every vector stored 60 times in
-/// a row (the last one 40 times), 17 centres, seed 100,007, 200 queries, m 16, efConstruction 200. The generator
-/// is the one `bench/ann-bench.spec.ts` uses (the same bytes in Rust and TypeScript). Heavy: run once with
-/// `cargo test --release -p ldvec --test hnsw_dup scale_duplicates_100k -- --ignored --nocapture`.
-#[test]
-#[ignore = "100,000 x 384; run with --release -- --ignored"]
-fn scale_duplicates_100k() {
+/// A native duplicate set of the shape of the browser bench's (docs/benchmarks/ann-duplicates.csv): 100,000 x 384, every
+/// vector stored `copies` times in a row, 17 centres, seed 100,007, 200 queries. It is NOT byte-identical to the browser
+/// bench's sets: that bench seeds with rows + copies and takes one centre per hundred base vectors (33 at 30 copies, 17
+/// at 60), through the same generator.
+fn scale_dataset(copies: usize) -> DataSet {
     let dim = 384;
     let rows = 100_000usize;
-    let copies: usize = std::env::var("HNSWDUP_COPIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
     let base = rows.div_ceil(copies);
     let (pts, q) = synth::clustered(100_007, 17, dim, base, 200);
     let mut vec = Vec::with_capacity(rows * dim);
@@ -958,14 +952,28 @@ fn scale_duplicates_100k() {
     }
     let mut queries = q;
     queries.truncate(200 * dim);
-    let d = DataSet {
+    DataSet {
         name: format!("bench set: 100,000 x 384, {copies} copies"),
         dim,
         vec,
         queries,
         group,
         max_group: copies as u32,
-    };
+    }
+}
+
+/// The native duplicate set (see `scale_dataset`): 100,000 x 384, every vector stored 60 times in a row (the last
+/// one 40 times) unless `HNSWDUP_COPIES` says otherwise, m 16, efConstruction 200. The generator is the one
+/// `bench/ann-bench.spec.ts` uses (the same bytes in Rust and TypeScript). Heavy: run once with
+/// `cargo test --release -p ldvec --test hnsw_dup scale_duplicates_100k -- --ignored --nocapture`.
+#[test]
+#[ignore = "100,000 x 384; run with --release -- --ignored"]
+fn scale_duplicates_100k() {
+    let copies: usize = std::env::var("HNSWDUP_COPIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let d = scale_dataset(copies);
     let mut g = build(&d, &params(16, 200, 1));
     let diag = diagnose(&g.serialize().unwrap(), &d.group);
     eprintln!(
@@ -1004,6 +1012,91 @@ fn scale_duplicates_100k() {
     );
 }
 
+/// The columns of `docs/benchmarks/ann-scale-duplicates-native.csv`. Recall only: no latency is measured here (a
+/// native run of a graph over synthetic data, not a browser, not an 8 GB figure).
+const SCALE_CSV_HEADER: &str = "commit,date_utc,machine,command,rows,dim,copies_per_vector,m,ef_construction,ef,k,queries,dup_max,near_max,degenerate,layer0_reachable,nodes,unreachable_group_rows,graph_alone_equal_to_flat,graph_alone_recall_at_10_by_score,eight_gb";
+
+/// The figures the README, the write-up and docs/vector-index.md quote for the 100,000 x 384 duplicate sets
+/// natively (the 2m boundary: "with 60 copies of every vector the graph missed the best group in 2 of 100
+/// queries at every ef, with 30 copies it missed none at ef 64 and 128"): the bench's set at 30 and at 60 copies,
+/// the graph alone (a degenerate graph is answered by the flat scan in the SDK; this measures what it would
+/// have answered), at ef 32, 64 and 128. With `LDVEC_WRITE_SCALE_CSV=1` it rewrites
+/// `docs/benchmarks/ann-scale-duplicates-native.csv` (`LDVEC_COMMIT` and `LDVEC_MACHINE` name the commit and the
+/// machine). Heavy (a few minutes): run once per change of the graph or the rule:
+/// `LDVEC_WRITE_SCALE_CSV=1 LDVEC_COMMIT="$(git describe --always --dirty)" LDVEC_MACHINE="<model>, <RAM> GB" cargo test --release -p ldvec --test hnsw_dup scale_duplicate_figures -- --ignored --nocapture`.
+#[test]
+#[ignore = "two graphs over 100,000 x 384; run with --release -- --ignored"]
+fn scale_duplicate_figures() {
+    let p = params(16, 200, 1);
+    let date = utc_now();
+    let commit = std::env::var("LDVEC_COMMIT").unwrap_or_else(|_| "not recorded".into());
+    let machine = std::env::var("LDVEC_MACHINE").unwrap_or_else(|_| "not recorded".into());
+    let command =
+        "cargo test --release -p ldvec --test hnsw_dup scale_duplicate_figures -- --ignored";
+    let mut rows_out: Vec<String> = Vec::new();
+    for copies in [30usize, 60] {
+        let d = scale_dataset(copies);
+        let mut g = build(&d, &p);
+        let diag = diagnose(&g.serialize().unwrap(), &d.group);
+        let degenerate = g.degenerate();
+        for ef in [32usize, 64, 128] {
+            let m = measure_with(&mut g, &d, K, ef, Some(&diag.group_reach));
+            rows_out.push(format!(
+                "{commit},{date},\"{machine}\",{command},{},{},{copies},{},{},{ef},{K},{QUERIES},{},{},{degenerate},{},{},{},{}/{QUERIES},{:.4},not measured on 8 GB",
+                d.vec.len() / d.dim,
+                d.dim,
+                p.m,
+                p.ef_construction,
+                g.dup_max(),
+                g.near_max(),
+                diag.reachable,
+                diag.nodes,
+                diag.unreachable_group_rows,
+                m.equal,
+                m.mean_recall,
+            ));
+            eprintln!("SCALECSV {}", rows_out.last().unwrap());
+        }
+    }
+    if std::env::var("LDVEC_WRITE_SCALE_CSV").as_deref() == Ok("1") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/benchmarks/ann-scale-duplicates-native.csv");
+        let mut text = String::from(SCALE_CSV_HEADER);
+        text.push('\n');
+        for r in &rows_out {
+            text.push_str(r);
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+    }
+}
+
+/// The current UTC time as `YYYY-MM-DDTHH:MM:SSZ` (no clock crate: the kernel and its tests have no dependency).
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // civil date from days since 1970 (Howard Hinnant's algorithm), UTC
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 // ---- the committed figures (docs/benchmarks/ann-near-duplicates.csv) ----------------------------------------------
 
 /// The columns of `docs/benchmarks/ann-near-duplicates.csv`. Recall only: no latency is measured here (a native run
@@ -1021,30 +1114,7 @@ const NEAR_CSV_HEADER: &str = "commit,date_utc,machine,command,family,rows,dim,g
 fn near_duplicate_figures() {
     let p = params(16, 200, 1);
     let mut rows_out: Vec<String> = Vec::new();
-    let date = {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        // civil date from days since 1970 (Howard Hinnant's algorithm), UTC
-        let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = if m <= 2 { y + 1 } else { y };
-        format!(
-            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-            rem / 3600,
-            rem % 3600 / 60,
-            rem % 60
-        )
-    };
+    let date = utc_now();
     let commit = std::env::var("LDVEC_COMMIT").unwrap_or_else(|_| "not recorded".into());
     let machine = std::env::var("LDVEC_MACHINE").unwrap_or_else(|_| "not recorded".into());
     let command =

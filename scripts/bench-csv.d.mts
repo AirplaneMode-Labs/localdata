@@ -16,3 +16,11 @@ export function summarise(rows: Array<Record<string, string>>): Array<{
   totalMedian: number;
   totalWorst: number;
 }>;
+export function readmePath(argv: string[], repo: string): string;
+export function checkBlock(
+  text: string,
+  begin: string,
+  end: string,
+  body: string,
+  name: string,
+): { ok: boolean; message: string };

@@ -6,10 +6,12 @@
 //
 //   node scripts/bench-ann-readme.mjs           print the block
 //   node scripts/bench-ann-readme.mjs --write   replace the block between the ann-bench:begin/end markers
+//   node scripts/bench-ann-readme.mjs --check   exit 1 unless both README blocks are exactly what the CSVs generate
+//                                               (--readme <file> checks or writes another file)
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parseCsv } from './bench-csv.mjs';
+import { checkBlock, parseCsv, readmePath } from './bench-csv.mjs';
 
 export { parseCsv };
 
@@ -273,7 +275,7 @@ export function renderAnnDup(rows) {
       .filter((v, i, a) => a.indexOf(v) === i)
       .join(
         ' and ',
-      )} of ${sums[0] ? commas(sums[0].rows) : 0} rows are exact copies of an earlier row), 384 dimensions, cosine, k = 10, HNSW with m = 16, efConstruction = 200, seed = 1. Copies of one vector tie, so recall is counted by score (a hit counts when its score is at least the flat scan's 10th best score) and "equal to flat" is the number of queries whose ten scores are, as a multiset and bit for bit, the flat scan's. A group of identical rows larger than 2m (32 at m = 16, the capacity of a layer-0 neighbour list) makes the graph degenerate and the exact flat scan answers with fallback \`duplicates\`: the columns "Answered by the graph" and "Answered by flat (duplicates)" say which path answered each row, so the set whose groups are within 2m is answered by the graph and the one whose groups are not is answered by the flat scan. A group of rows that share one quantised key (the same vector up to the low 12 mantissa bits of every component) larger than 2m makes a graph degenerate in the same way (TD-126); this CSV has no column for it, and the same data was rebuilt natively after that rule (\`scale_duplicates_100k\` in \`crates/ldvec/tests/hnsw_dup.rs\`) with the same outcome: 30 copies not degenerate, 60 degenerate. The 8 GB Windows no-GPU laptop column is ${EIGHT_GB}.`,
+      )} of ${sums[0] ? commas(sums[0].rows) : 0} rows are exact copies of an earlier row), 384 dimensions, cosine, k = 10, HNSW with m = 16, efConstruction = 200, seed = 1. Copies of one vector tie, so recall is counted by score (a hit counts when its score is at least the flat scan's 10th best score) and "equal to flat" is the number of queries whose ten scores are, as a multiset and bit for bit, the flat scan's. A group of identical rows larger than 2m (32 at m = 16, the capacity of a layer-0 neighbour list) makes the graph degenerate and the exact flat scan answers with fallback \`duplicates\`: the columns "Answered by the graph" and "Answered by flat (duplicates)" say which path answered each row, so the set whose groups are within 2m is answered by the graph and the one whose groups are not is answered by the flat scan. A group of rows that share one quantised key (the same vector up to the low 12 mantissa bits of every component) larger than 2m makes a graph degenerate in the same way (TD-126); this CSV has no column for it, and data of the same shape (every vector stored 30 or 60 times at 100,000 x 384, the same generator, not the byte-identical sets of this run) was rebuilt natively after that rule (\`scale_duplicate_figures\` in \`crates/ldvec/tests/hnsw_dup.rs\`, rows in [docs/benchmarks/ann-scale-duplicates-native.csv](docs/benchmarks/ann-scale-duplicates-native.csv)) with the same outcome: 30 copies not degenerate, 60 degenerate. The 8 GB Windows no-GPU laptop column is ${EIGHT_GB}.`,
   );
   lines.push('');
   lines.push(
@@ -311,8 +313,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const block = renderAnnBench(rows, readAnnNote());
   const dupRows = existsSync(ANN_DUP_CSV) ? parseCsv(readFileSync(ANN_DUP_CSV, 'utf8')) : [];
   const dupBlock = dupRows.length > 0 ? renderAnnDup(dupRows) : undefined;
-  if (process.argv.includes('--write')) {
-    const readme = join(repoRoot, 'README.md');
+  const readme = readmePath(process.argv, repoRoot);
+  if (process.argv.includes('--check')) {
+    const text = readFileSync(readme, 'utf8');
+    const results = [checkBlock(text, BEGIN, END, block, 'ann-bench')];
+    if (dupBlock !== undefined)
+      results.push(checkBlock(text, DUP_BEGIN, DUP_END, dupBlock, 'ann-dup-bench'));
+    for (const r of results) (r.ok ? console.log : console.error)(r.message);
+    process.exit(results.every((r) => r.ok) ? 0 : 1);
+  } else if (process.argv.includes('--write')) {
     let text = readFileSync(readme, 'utf8');
     const swap = (begin, end, body) => {
       const a = text.indexOf(begin);

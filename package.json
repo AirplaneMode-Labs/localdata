@@ -65,6 +65,8 @@
     "bench:ann": "playwright test -c test/browser/playwright.bench.config.ts ann-bench",
     "bench:ann-readme": "node scripts/bench-ann-readme.mjs --write",
     "bench:delete-cost": "playwright test -c test/browser/playwright.bench.config.ts delete-cost",
+    "bench:wasm-size": "node scripts/bench-wasm-size.mjs --write",
+    "bench:check": "node scripts/bench-readme.mjs --check && node scripts/bench-docs-readme.mjs --check && node scripts/bench-ann-readme.mjs --check && node scripts/bench-wasm-size.mjs --check && node scripts/bench-figures.mjs",
     "release:rehearse": "node scripts/release/rehearse.mjs"
   },
   "devDependencies": {
