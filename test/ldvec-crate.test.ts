@@ -46,7 +46,7 @@ describe('the ldvec crate manifest', () => {
     expect(comment).toMatch(/TD-65/u);
     expect(comment).toMatch(/HNSW/u);
     expect(comment, 'the old flat-only line count is gone').not.toMatch(/about 300 lines/u);
-    expect(comment).toMatch(/1,050 lines/u);
+    expect(comment).toMatch(/1,300 lines/u);
   });
 
   it('has no dev-, build- or target-specific dependency tables either', () => {
@@ -66,6 +66,6 @@ describe('the ldvec crate manifest', () => {
   it('the line count the comment states is the size of src/hnsw.rs (to the nearest fifty)', () => {
     const hnsw = readFileSync(join(root, 'crates', 'ldvec', 'src', 'hnsw.rs'), 'utf8');
     const n = hnsw.split('\n').length - (hnsw.endsWith('\n') ? 1 : 0);
-    expect(Math.abs(n - 1050)).toBeLessThanOrEqual(75);
+    expect(Math.abs(n - 1300)).toBeLessThanOrEqual(75);
   });
 });

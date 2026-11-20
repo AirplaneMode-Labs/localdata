@@ -135,7 +135,7 @@ describe('a refused graph is rebuilt from the stored vectors', () => {
     const fresh = await freshHits();
     const base = await committed();
     const len = (await graphOf(base)).length;
-    for (const cut of [0, 8, 55, 56, 61, 100, len >> 1, len - 5, len - 1]) {
+    for (const cut of [0, 8, 55, 56, 59, 60, 61, 65, 100, len >> 1, len - 5, len - 1]) {
       const d = await clone(base);
       await putGraph(d, (await graphOf(d)).slice(0, cut));
       await expectRepaired(d, 'length', fresh);
@@ -145,8 +145,10 @@ describe('a refused graph is rebuilt from the stored vectors', () => {
   it('a flipped byte (reason crc), a wrong magic (magic), a bad version (version)', async () => {
     const fresh = await freshHits();
     const base = await committed();
-    const len = (await graphOf(base)).length;
-    for (const at of [60, 300, len >> 1, len - 1]) {
+    const whole = await graphOf(base);
+    const len = whole.length;
+    // 56 is the near-duplicate count (header word 56), 60 + nsLen the first node-table byte
+    for (const at of [56, 60 + whole[11]!, 300, len >> 1, len - 1]) {
       const d = await clone(base);
       const g = await graphOf(d);
       g[at] = g[at]! ^ 0x10;
@@ -207,7 +209,7 @@ describe('a refused graph is rebuilt from the stored vectors', () => {
     const dv = new DataView(g.buffer);
     const nsLen = g[11]!;
     const nodes = dv.getUint32(32, true);
-    const links = 56 + nsLen + 8 * nodes;
+    const links = 60 + nsLen + 8 * nodes;
     const d1 = await clone(base);
     const g1 = g.slice();
     new DataView(g1.buffer).setUint32(links + 4, nodes, true);
@@ -216,10 +218,39 @@ describe('a refused graph is rebuilt from the stored vectors', () => {
     await expectRepaired(d1, 'links', fresh);
     const d2 = await clone(base);
     const g2 = g.slice();
-    g2[56 + nsLen + 4] = 17;
+    g2[60 + nsLen + 4] = 17;
     recrc(g2);
     await putGraph(d2, g2);
     await expectRepaired(d2, 'bounds', fresh);
+  });
+
+  it('a header whose params differ from the stored params record (S1-123, S1-128): refused with reason params before anything is reserved, then rebuilt', async () => {
+    const fresh = await freshHits();
+    const base = await committed(); // stored params: m 12, efConstruction 100, seed 9
+    for (const [name, off, value] of [
+      ['m 64', 16, 64],
+      ['m 4', 16, 4],
+      ['efConstruction 1000', 20, 1000],
+      ['seed', 24, 77],
+    ] as Array<[string, number, number]>) {
+      const d = await clone(base);
+      const g = await graphOf(d);
+      new DataView(g.buffer).setUint32(off, value, true);
+      recrc(g);
+      await putGraph(d, g);
+      const o = await expectRepaired(d, 'params', fresh);
+      expect(
+        opens(o.events).map((e) => e.attrs['reason']),
+        name,
+      ).toEqual(['params']);
+    }
+    // the metric byte: 1 (dot) in a header whose namespace was built for cosine
+    const m = await clone(base);
+    const gm = await graphOf(m);
+    gm[10] = 1;
+    recrc(gm);
+    await putGraph(m, gm);
+    await expectRepaired(m, 'params', fresh);
   });
 
   it('refused again after the rebuild: the index is dropped, queries answer flat with fallback refused, and there is no loop', async () => {
@@ -386,7 +417,7 @@ describe('liveness comes from the flat HEAD, never from the graph', () => {
     const nsLen = g[11]!;
     const nodes = dv.getUint32(32, true);
     expect(dv.getUint32(36, true)).toBe(nodes - 3); // the graph noted the deletes
-    const table = 56 + nsLen;
+    const table = 60 + nsLen;
     let cleared = 0;
     for (let i = 0; i < nodes; i++) {
       if (g[table + 8 * i + 5] === 1) {

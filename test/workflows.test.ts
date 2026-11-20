@@ -18,6 +18,10 @@ const TABLE: Record<string, [string, string]> = {
   'actions/deploy-pages': ['368f82528645a54fb793d4d04e342629a3f51346', 'v5.0.1'],
   'dtolnay/rust-toolchain': ['683b588c487a69d01f6c6ddf40f036ff682cc2c8', 'v1'],
   'Swatinem/rust-cache': ['d1527c8f67ef9af357290475d4af4b0fab8f12e0', 'v2.9.3'],
+  // Sprint 7 (release readiness): the rehearsal job and the owner-only publish workflow
+  'actions/upload-artifact': ['cf430e030ddbb5b0abf93d22962f4752f3646cd9', 'v7.0.2'],
+  'actions/download-artifact': ['9000827ccba6bdab643e8b6fd33ac0654aef8333', 'v8.0.2'],
+  'actions/attest-build-provenance': ['4d101475d8b20a2381f78447822ac1eab6504dd8', 'v4.2.2'],
 };
 
 /** The job blocks of a workflow: [name, body]. */
@@ -29,8 +33,8 @@ function jobs(src: string): Array<[string, string]> {
 }
 
 describe('workflows', () => {
-  it('has the three workflows', () => {
-    expect(files.sort()).toEqual(['ci.yml', 'pages.yml']);
+  it('has the three workflows (ci, pages and the owner-only publish; the last is policy-tested in test/workflows-release.test.ts)', () => {
+    expect(files.sort()).toEqual(['ci.yml', 'pages.yml', 'publish.yml']);
   });
 
   it('every uses: line is owner/repo@<40-hex SHA> # <tag> from the conventions table', () => {
@@ -49,15 +53,16 @@ describe('workflows', () => {
     expect(n).toBeGreaterThanOrEqual(12);
   });
 
-  it('adds no action outside the table: only dtolnay/rust-toolchain and Swatinem/rust-cache are new to localdata', () => {
+  it('adds no action outside the table', () => {
     const used = new Set<string>();
     for (const src of text.values())
       for (const m of src.matchAll(/uses:\s*([^@\s]+)@/g)) used.add(m[1]!);
     for (const u of used) expect(Object.keys(TABLE)).toContain(u);
   });
 
-  it('nothing publishes, releases or registers anything', () => {
+  it('nothing in ci.yml or pages.yml publishes, releases or registers anything (publish.yml is the owner-only exception)', () => {
     for (const [f, src] of text) {
+      if (f === 'publish.yml') continue;
       for (const bad of [
         'npm publish',
         'cargo publish',
@@ -74,18 +79,21 @@ describe('workflows', () => {
     }
   });
 
-  it('pages: write and id-token: write appear only on the deploy job', () => {
+  it('pages: write and id-token: write appear only on the deploy job, and id-token: write on the publish job of publish.yml', () => {
     for (const [f, src] of text) {
       for (const [name, body] of jobs(src)) {
         const writes = /pages:\s*write|id-token:\s*write/.test(body);
-        expect(writes, `${f}: ${name}`).toBe(f === 'pages.yml' && name === 'deploy');
+        const allowed =
+          (f === 'pages.yml' && name === 'deploy') || (f === 'publish.yml' && name === 'publish');
+        expect(writes, `${f}: ${name}`).toBe(allowed);
       }
     }
   });
 
   it('every job sets its own permissions, and the build jobs (with the Rust toolchain) only read contents', () => {
     for (const [f, src] of text) {
-      expect(src).toMatch(/\npermissions:\n {2}contents: read\n/);
+      if (f === 'publish.yml') expect(src).toMatch(/\npermissions: \{\}\n/);
+      else expect(src).toMatch(/\npermissions:\n {2}contents: read\n/);
       for (const [name, body] of jobs(src)) {
         expect(/\n {4}permissions:\n/.test(body), `${f}: ${name} has permissions`).toBe(true);
         if (body.includes('rust-toolchain'))

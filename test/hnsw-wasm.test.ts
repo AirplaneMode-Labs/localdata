@@ -122,16 +122,34 @@ function serialize(k: Kernel, h: number): Uint8Array {
   }
 }
 
+/** The params of a graph built by `build()` without overrides: what the namespace's params record would say. */
+const BUILD_DEFAULTS = { metric: 0, m: 16, efConstruction: 200, seed: 1 };
+
 function load(
   k: Kernel,
   bytes: Uint8Array,
-  e: { dim: number; rows: number; generation: number; ns: string },
+  e: {
+    dim: number;
+    rows: number;
+    generation: number;
+    ns: string;
+    params?: { metric: number; m: number; efConstruction: number; seed: number };
+  },
 ): number {
   const p = put(k, bytes);
   const nsb = ENC.encode(e.ns);
   const np = put(k, nsb);
   try {
-    return k.hnswLoad(p, bytes.byteLength, e.dim, e.rows, e.generation, np, nsb.length);
+    return k.hnswLoad(
+      p,
+      bytes.byteLength,
+      e.dim,
+      e.rows,
+      e.generation,
+      np,
+      nsb.length,
+      e.params ?? BUILD_DEFAULTS,
+    );
   } finally {
     k.free(p, Math.max(1, bytes.byteLength));
     k.free(np, Math.max(1, nsb.length));
@@ -287,7 +305,13 @@ for (const kind of ['simd', 'scalar'] as KernelKind[]) {
       expect(k.hnswInfo(h, info)).toBe(0);
       const w = k.u32(info, 12);
       expect(Array.from(w.subarray(5, 9))).toEqual([300, 299, 3, w[8]!]); // nodes, live, generation
-      const again = load(k, bytes, { dim, rows: 300, generation: 3, ns: 'inc' });
+      const again = load(k, bytes, {
+        dim,
+        rows: 300,
+        generation: 3,
+        ns: 'inc',
+        params: { metric: 0, m: 8, efConstruction: 40, seed: 4 },
+      });
       expect(again).toBeGreaterThan(0);
       expect(sha256(serialize(k, again))).toBe(sha256(bytes));
       // inserting an ordinal that is not above the last, or past the block table, is an error code
@@ -303,7 +327,13 @@ for (const kind of ['simd', 'scalar'] as KernelKind[]) {
         k,
         build(k, rows, { m: 4, efc: 20, seed: 9, generation: 5, ns: 'ns.a' }),
       );
-      const e = { dim, rows: 60, generation: 5, ns: 'ns.a' };
+      const e = {
+        dim,
+        rows: 60,
+        generation: 5,
+        ns: 'ns.a',
+        params: { metric: 0, m: 4, efConstruction: 20, seed: 9 },
+      };
       expect(load(k, good, e)).toBeGreaterThan(0);
       for (let cut = 0; cut < good.length; cut += 7)
         expect(load(k, good.slice(0, cut), e)).toBe(-22);
@@ -362,7 +392,13 @@ for (const kind of ['simd', 'scalar'] as KernelKind[]) {
         k,
         build(k, rows, { m: 4, efc: 20, seed: 9, generation: 5, ns: 'ns.a' }),
       );
-      const e = { dim, rows: 60, generation: 5, ns: 'ns.a' };
+      const e = {
+        dim,
+        rows: 60,
+        generation: 5,
+        ns: 'ns.a',
+        params: { metric: 0, m: 4, efConstruction: 20, seed: 9 },
+      };
       let a = 0x1d4_0003;
       const rnd = () => {
         a = (a + 0x6d2b79f5) >>> 0;

@@ -75,7 +75,7 @@ describe('the embedded modules', () => {
     });
   }
 
-  it('both modules export the ten HNSW functions and the size budget holds with them (TD-65: the graph adds 40 to 45 KB)', () => {
+  it('both modules export the twelve HNSW functions and the size budget holds with them (TD-65: the graph adds 40 to 45 KB)', () => {
     const NAMES = [
       'ldv_hnsw_build',
       'ldv_hnsw_load',
@@ -87,6 +87,8 @@ describe('the embedded modules', () => {
       'ldv_hnsw_serialize_len',
       'ldv_hnsw_serialize',
       'ldv_hnsw_free',
+      'ldv_hnsw_dup_stats',
+      'ldv_hnsw_set_dup_stats',
     ];
     for (const kind of ['simd', 'scalar'] as const) {
       const mod = new WebAssembly.Module(readFileSync(wasmPath(kind)));

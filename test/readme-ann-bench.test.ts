@@ -8,17 +8,25 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ANN_COLUMNS,
+  ANN_DUP_COLUMNS,
   BEGIN,
+  DUP_BEGIN,
+  DUP_END,
   EIGHT_GB,
   END,
+  UNDER_LOAD,
+  hostLoadCell,
   parseCsv,
   readAnnNote,
   renderAnnBench,
+  renderAnnDup,
 } from '../scripts/bench-ann-readme.mjs';
 
 const root = join(import.meta.dirname, '..');
 const readme = readFileSync(join(root, 'README.md'), 'utf8');
 const csvText = readFileSync(join(root, 'docs', 'benchmarks', 'ann.csv'), 'utf8');
+const dupText = readFileSync(join(root, 'docs', 'benchmarks', 'ann-duplicates.csv'), 'utf8');
+const dupRows = parseCsv(dupText);
 const rows = parseCsv(csvText);
 const note = readAnnNote();
 
@@ -33,10 +41,69 @@ function block(): string {
 const where = (r: Record<string, string>) =>
   `${r['data']} ${r['rows']} ${r['index_kind']} ef ${r['ef_search']} run ${r['run']}`;
 
+describe('the host-load columns (quiet slot Q2, TD-124)', () => {
+  it('are the last two columns of both CSVs, after the 8 GB cell', () => {
+    expect(ANN_COLUMNS.slice(-3)).toEqual(['eight_gb', 'host_load_1m_start', 'host_load_1m_end']);
+    expect(ANN_DUP_COLUMNS.slice(-3)).toEqual([
+      'eight_gb',
+      'host_load_1m_start',
+      'host_load_1m_end',
+    ]);
+  });
+
+  it("print '' on win32 (os.loadavg() is always 0 there) and the load to two decimals elsewhere", () => {
+    expect(hostLoadCell('win32', 1.234)).toBe('');
+    expect(hostLoadCell('darwin', 1.234)).toBe('1.23');
+    expect(hostLoadCell('linux', 0)).toBe('0');
+    expect(hostLoadCell('linux', Number.NaN)).toBe('');
+  });
+
+  it('every row of both CSVs carries a load or, on win32, nothing', () => {
+    for (const r of [...rows, ...dupRows]) {
+      for (const c of ['host_load_1m_start', 'host_load_1m_end']) {
+        if (r['os']!.startsWith('win32')) expect(r[c], `${where(r)} ${c}`).toBe('');
+        else expect(Number(r[c]), `${where(r)} ${c}`).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  it('a row measured under a start load above 4 labels its latency cells "measured under load" and nothing else', () => {
+    const loadedRows = rows.map((r) => ({ ...r, host_load_1m_start: '5.2' }));
+    const b = renderAnnBench(loadedRows, note);
+    expect(b).toContain(`(${UNDER_LOAD})`);
+    const quiet = renderAnnBench(
+      rows.map((r) => ({ ...r, host_load_1m_start: '1', host_load_1m_end: '1.5' })),
+      note,
+    );
+    expect(quiet).not.toContain(UNDER_LOAD);
+    // the recall cell is never labelled
+    for (const l of b.split('\n').filter((x) => x.startsWith('| ') && x.includes(UNDER_LOAD))) {
+      const cells = l.split('|').map((c) => c.trim());
+      expect(cells[10], 'recall cell').toMatch(/^\d\.\d{3}$/);
+    }
+  });
+});
+
 describe('docs/benchmarks/ann.csv', () => {
   it('has the documented header and rows', () => {
     expect(csvText.split('\n')[0]).toBe(ANN_COLUMNS.join(','));
     expect(rows.length).toBeGreaterThan(0);
+  });
+
+  it('the clustered 100,000 x 384 recall meets the floors stated before the duplicate fix: 0.99 at ef 32, and 1 at ef 64 and 128', () => {
+    const big = rows.filter(
+      (r) =>
+        r['data'] === 'clustered' && Number(r['rows']) === 100000 && r['index_kind'] === 'hnsw',
+    );
+    for (const [ef, floor] of [
+      ['32', 0.99],
+      ['64', 0.9995],
+      ['128', 0.9995],
+    ] as const) {
+      const rs = big.filter((r) => r['ef_search'] === ef).map((r) => Number(r['recall_at_10']));
+      expect(rs.length, `ef ${ef} runs`).toBeGreaterThanOrEqual(3);
+      expect(Math.min(...rs), `ef ${ef} recall@10`).toBeGreaterThanOrEqual(floor);
+    }
   });
 
   it('every row names the machine and the command, reads "not measured on 8 GB", and has generated provenance', () => {
@@ -138,5 +205,95 @@ describe('README HNSW benchmarks', () => {
   it('keeps quantisation, compaction and encryption at rest "not yet"', () => {
     const b = block();
     expect(b).toContain('Quantisation, compaction and encryption at rest are not done');
+  });
+});
+
+describe('docs/benchmarks/ann-duplicates.csv and its README block (TD-109, BUG-T2-S6-14)', () => {
+  const dupWhere = (r: Record<string, string>) =>
+    `${r['data']} ${r['rows']} x${r['copies_per_vector']} ef ${r['ef_search']} run ${r['run']}`;
+  const dupBlock = () => {
+    const a = readme.indexOf(DUP_BEGIN);
+    const b = readme.indexOf(DUP_END);
+    expect(a, 'README has the ann-dup-bench:begin marker').toBeGreaterThanOrEqual(0);
+    expect(b, 'README has the ann-dup-bench:end marker').toBeGreaterThan(a);
+    return readme.slice(a + DUP_BEGIN.length, b).trim();
+  };
+
+  it('has the documented header, and every row reads "not measured on 8 GB" with provenance', () => {
+    expect(dupText.split('\n')[0]).toBe(ANN_DUP_COLUMNS.join(','));
+    expect(dupRows.length).toBeGreaterThan(0);
+    for (const r of dupRows) {
+      expect(r['eight_gb'], dupWhere(r)).toBe(EIGHT_GB);
+      expect(r['machine'], dupWhere(r)).toMatch(/^.+, \d+ GB$/);
+      expect(r['command'], dupWhere(r)).toMatch(/npm run bench:ann$/);
+      expect(r['commit'], dupWhere(r)).toMatch(/^[0-9a-f]{7,40}(-dirty)?$/);
+      expect(Number(r['dim']), dupWhere(r)).toBe(384);
+      expect([30, 60], dupWhere(r)).toContain(Number(r['copies_per_vector']));
+      expect(Number(r['queries']), dupWhere(r)).toBe(200);
+      expect(Number(r['answered_by_graph']) + Number(r['answered_by_flat_duplicates'])).toBe(
+        Number(r['queries']),
+      );
+    }
+  });
+
+  it('holds the floors stated before measuring: at ef 64 and 128, at least 99% of the queries equal to flat and a mean recall@10 by score of at least 0.99, whichever path answered', () => {
+    for (const r of dupRows.filter((x) => ['64', '128'].includes(x['ef_search']!))) {
+      expect(Number(r['queries_equal_to_flat']), dupWhere(r)).toBeGreaterThanOrEqual(
+        0.99 * Number(r['queries']),
+      );
+      expect(Number(r['recall_at_10_by_score']), dupWhere(r)).toBeGreaterThanOrEqual(0.99);
+      expect(Number(r['duplicate_rows']), dupWhere(r)).toBeGreaterThan(0);
+    }
+  });
+
+  it('30 copies per vector (a group within 2m = 32) are answered by the graph; 60 (more than 2m) make the graph degenerate and the flat scan answers every query, exactly', () => {
+    for (const r of dupRows) {
+      if (r['copies_per_vector'] === '30') {
+        expect(Number(r['answered_by_graph']), dupWhere(r)).toBe(Number(r['queries']));
+        expect(Number(r['answered_by_flat_duplicates']), dupWhere(r)).toBe(0);
+      } else {
+        expect(Number(r['answered_by_flat_duplicates']), dupWhere(r)).toBe(Number(r['queries']));
+        expect(Number(r['answered_by_graph']), dupWhere(r)).toBe(0);
+        expect(Number(r['queries_equal_to_flat']), dupWhere(r)).toBe(Number(r['queries']));
+        expect(Number(r['recall_at_10_by_score']), dupWhere(r)).toBe(1);
+      }
+    }
+    expect(new Set(dupRows.map((r) => r['copies_per_vector']))).toEqual(new Set(['30', '60']));
+  });
+
+  it('the README block equals what the CSV renders to', () => {
+    expect(dupBlock()).toBe(renderAnnDup(dupRows).trim());
+  });
+
+  it('the README no longer carries the internal label "T2 measured" and cites the committed CSV', () => {
+    expect(readme).not.toContain('T2 measured');
+    expect(readme).toContain('docs/benchmarks/ann-duplicates.csv');
+  });
+});
+
+describe('docs/benchmarks/ann-s6-format-v1.csv: the Sprint 6 rows, kept as measured', () => {
+  const v1Text = readFileSync(join(root, 'docs', 'benchmarks', 'ann-s6-format-v1.csv'), 'utf8');
+  const v1 = parseCsv(v1Text);
+
+  it('has the Sprint 6 columns plus format and remeasured_in_sprint_7, and its rows are labelled LDHNSW01 and not re-measured', () => {
+    expect(v1Text.split('\n')[0]).toBe(
+      [
+        ...ANN_COLUMNS.filter((c) => !c.startsWith('host_load')),
+        'format',
+        'remeasured_in_sprint_7',
+      ].join(','),
+    );
+    expect(v1.length).toBe(20);
+    for (const r of v1) {
+      expect(r['format'], where(r)).toBe('LDHNSW01 (0.4.0-alpha.0, Sprint 6)');
+      expect(r['remeasured_in_sprint_7'], where(r)).toBe('no');
+      expect(r['eight_gb'], where(r)).toBe(EIGHT_GB);
+      expect(r['commit'], where(r)).toBe('da39477-dirty');
+    }
+  });
+
+  it('the README names it and says the two formats can be compared', () => {
+    expect(readme).toContain('docs/benchmarks/ann-s6-format-v1.csv');
+    expect(readme).toContain('not re-measured');
   });
 });

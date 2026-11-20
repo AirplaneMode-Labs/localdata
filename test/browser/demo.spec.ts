@@ -82,7 +82,7 @@ async function open(page: Page): Promise<void> {
   await page.waitForSelector('body[data-ready="1"]');
 }
 
-test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a build id, the Sprint 6 status line and the not-yet box', async ({
+test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a build id, the Sprint 7 status line and the not-yet box', async ({
   page,
 }) => {
   const w = watch(page);
@@ -92,8 +92,14 @@ test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a
     .getAttribute('content');
   expect(csp).toBe(CSP);
   const status = (await page.locator('#sprint-status').innerText()).replace(/\s+/g, ' ').trim();
-  expect(status).toMatch(/^Sprint 6 \(19 Nov 2026\): Working: .+\. Not yet: .+\.$/);
+  expect(status).toMatch(/^Sprint 7 \(20 Nov 2026\): Working: .+\. Not yet: .+\.$/);
   expect(status).toContain('not measured on 8 GB');
+  // BUG-T1-S7-04: the duplicate claim is worded as the measured floor, with its limit, never as "no longer fails"
+  expect(status).toContain('with up to 32 exact copies of a vector');
+  expect(status).toContain('at least 99 of 100 queries return the flat scan');
+  expect(status).toContain('in the measured synthetic sets');
+  expect(status).toContain('wider tight clusters are not detected');
+  expect(status).not.toMatch(/no longer fails quietly/);
   const build = (await page.locator('#build-sha').innerText()).trim();
   expect(build).toMatch(
     /^(Built from main at [0-9a-f]{12}|Local build ([0-9a-f]{12}(-dirty)?|local))$/,
@@ -105,7 +111,10 @@ test('the demo under /localdata/: no errors, same-origin only, the pinned CSP, a
     'encryption at rest',
     'hnsw for',
     'querychunks',
+    'batched delete',
     'not measured on 8 gb',
+    'wider tight clusters are not detected',
+    'low 12 mantissa bits',
   ])
     expect(box, phrase).toContain(phrase);
   await expect(page.locator('#documents h2')).toHaveText('Documents');
@@ -251,6 +260,25 @@ for (const driver of ['opfs', 'indexeddb'] as const) {
     await expect(page.locator('#ann-events')).toContainText('(outcome ok)');
     await expect(page.locator('#ann-which')).toContainText('hnsw, answered by hnsw');
 
+    // The SDK rebuilds a refused graph at most once per generation, so a second damage at the same generation is
+    // dropped, not rebuilt: build again (a fresh generation, no marker) before showing the old-format file.
+    await page.locator('#ann-build').click();
+    await expect(page.locator('#ann-status')).toContainText(`built 20,000 rows on ${driver}`, {
+      timeout: 180_000,
+    });
+    // a graph file of the first format (LDHNSW01): refused with the reason version, rebuilt from the stored vectors
+    await page.locator('#ann-old-format').click();
+    await expect(page.locator('#ann-status')).toContainText(
+      'as a graph of the first format (LDHNSW01)',
+    );
+    await page.locator('#ann-run').click();
+    await expect(page.locator('#ann-status')).toContainText('hnsw answered 50 queries', {
+      timeout: 120_000,
+    });
+    await expect(page.locator('#ann-events')).toContainText('graph refused (reason version)');
+    await expect(page.locator('#ann-events')).toContainText('rebuilt from the stored vectors in');
+    await expect(page.locator('#ann-which')).toContainText('hnsw, answered by hnsw');
+
     // the rebuilt graph persisted: after a reload the graph passes validation and answers
     await page.reload();
     await page.waitForSelector('body[data-ready="1"]');
@@ -266,6 +294,61 @@ for (const driver of ['opfs', 'indexeddb'] as const) {
     expect(events).toMatch(/requested='(flat|hnsw)' index='(flat|hnsw)' fallback=''/);
     for (const leak of ['chunk-0', 'Float32Array']) expect(events.includes(leak)).toBe(false);
 
+    await page.locator('#ann-delete').click();
+    await expect(page.locator('#ann-status')).toContainText('index deleted');
+    expect(w.errors).toEqual([]);
+    expect(w.foreign).toEqual([]);
+  });
+
+  test(`Flat or HNSW over exact duplicates on ${driver}: every vector stored 20 times is answered by the graph; one vector stored 300 times makes the graph degenerate and the exact flat scan answers`, async ({
+    page,
+  }) => {
+    test.setTimeout(300_000);
+    const w = watch(page);
+    if (driver === 'indexeddb')
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator.storage, 'getDirectory', {
+          value: undefined,
+          configurable: true,
+        });
+      });
+    await open(page);
+    await page.locator('#ann-delete').click();
+    await expect(page.locator('#ann-status')).toContainText('index deleted');
+
+    // 1,000 vectors, each stored 20 times: 19,000 exact duplicate rows, below efConstruction per group
+    await page.locator('#ann-data').selectOption('copies');
+    await page.locator('#ann-build').click();
+    await expect(page.locator('#ann-status')).toContainText(`built 20,000 rows on ${driver}`, {
+      timeout: 180_000,
+    });
+    await expect(page.locator('#ann-status')).toContainText('exact duplicate rows 19,000');
+    await page.locator('#ann-kind').selectOption('hnsw');
+    await page.locator('#ann-run').click();
+    await expect(page.locator('#ann-status')).toContainText('hnsw answered 50 queries');
+    await expect(page.locator('#ann-which')).toContainText('hnsw, answered by hnsw');
+    await expect(page.locator('#ann-which')).not.toContainText('fell back');
+    await expect(page.locator('#ann-dup')).toContainText('19,000');
+    const recall = Number(
+      /^(\d\.\d{3}) /.exec(await page.locator('#ann-recall').innerText())?.[1] ?? 'NaN',
+    );
+    expect(recall).toBeGreaterThanOrEqual(0.99);
+
+    // one vector stored 300 times (more than 2m, 32): degenerate, the flat scan answers
+    await page.locator('#ann-data').selectOption('many');
+    await page.locator('#ann-build').click();
+    await expect(page.locator('#ann-status')).toContainText(`built 20,000 rows on ${driver}`, {
+      timeout: 180_000,
+    });
+    await expect(page.locator('#ann-status')).toContainText('exact duplicate rows 299');
+    await page.locator('#ann-run').click();
+    await expect(page.locator('#ann-status')).toContainText('answered 50 queries');
+    await expect(page.locator('#ann-which')).toContainText(
+      'answered by flat (fell back: duplicates)',
+    );
+    await expect(page.locator('#ann-recall')).toContainText('1.000');
+
+    await page.locator('#ann-data').selectOption('clustered');
     await page.locator('#ann-delete').click();
     await expect(page.locator('#ann-status')).toContainText('index deleted');
     expect(w.errors).toEqual([]);

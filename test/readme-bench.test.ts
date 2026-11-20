@@ -109,10 +109,11 @@ describe('README benchmarks', () => {
     expect(b).toContain('Apple M5 Pro, 48 GB; not measured on 8 GB');
   });
 
-  it('keeps the README sections of the Sprint 6 conventions, in order, and no others', () => {
+  it('keeps the README sections of the Sprint 7 conventions (the Sprint 6 ones plus "Try it in two minutes"), in order, and no others', () => {
     const h2 = [...readme.matchAll(/^## (.+)$/gm)].map((m) => m[1]);
     expect(h2).toEqual([
       'Status',
+      'Try it in two minutes',
       'Install',
       'Quick start',
       'How it works',
@@ -126,10 +127,35 @@ describe('README benchmarks', () => {
     ]);
   });
 
-  it('opens its Status with the Sprint 6 status line (Working: ... Not yet: ...)', () => {
-    const status = readme.slice(readme.indexOf('\n## Status'), readme.indexOf('\n## Install'));
-    expect(status).toMatch(/\nSprint 6 \(19 Nov 2026\): Working: .+\. Not yet: .+\.\n/);
+  it('opens its Status with the Sprint 7 status line (Working: ... Not yet: ...)', () => {
+    const status = readme.slice(
+      readme.indexOf('\n## Status'),
+      readme.indexOf('\n## Try it in two minutes'),
+    );
+    expect(status).toMatch(/\nSprint 7 \(20 Nov 2026\): Working: .+\. Not yet: .+\.\n/);
     expect(status).toContain('not measured on 8 GB');
+  });
+
+  it('words the duplicate claim as the measured floor with its limit, and the demo page carries the same line (BUG-T1-S7-04)', () => {
+    const status = readme.slice(
+      readme.indexOf('\n## Status'),
+      readme.indexOf('\n## Try it in two minutes'),
+    );
+    const line = /\nSprint 7 \(20 Nov 2026\): Working: .+\. Not yet: .+\.\n/
+      .exec(status)![0]
+      .trim();
+    expect(line).toContain('with up to 32 exact copies of a vector');
+    expect(line).toContain('at least 99 of 100 queries return the flat scan');
+    expect(line).toContain('in the measured synthetic sets');
+    expect(line).toContain('wider tight clusters are not detected');
+    expect(line).not.toMatch(/no longer fails quietly/);
+    // the same text in the demo page (the browser test checks what the page shows; this one is the source)
+    const html = readFileSync(join(root, 'demo', 'index.html'), 'utf8')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\s+/g, ' ');
+    expect(html).toContain(line.replace(/\s+/g, ' '));
+    // and nothing in the README still calls the near-duplicate case measured when it is not
+    expect(readme).not.toMatch(/T2 measured/);
   });
 
   it('says nothing is published or tagged, and that the names are not reserved', () => {

@@ -6,9 +6,10 @@
 //   * graph bytes are in usage().bytes and annBytes, and count toward the pre-write quota check: a
 //     namespace with a graph can refuse a putVectors that a flat-only namespace accepts
 //   * clearing a namespace leaves no '__ld_ann.' record
-//   * BUG-T2-S6-03 (fix round 1): a store's kernel holds at most HNSW_MAX_GRAPHS (64) loaded graphs; the
-//     65th buildIndex throws quota_exceeded with reason 'max_graphs' (not 'wasm_memory'), writes nothing,
-//     dropIndex of one namespace lets it build, and every namespace still answers queries
+//   * BUG-T2-S6-03 (fix round 1): a store's kernel holds at most HNSW_MAX_GRAPHS (64) loaded graphs. Since
+//     Sprint 7 (TD-110, BUG-T2-S6-15) the 65th buildIndex releases the in-memory instance of the least
+//     recently used idle graph and succeeds; it throws quota_exceeded 'max_graphs' (not 'wasm_memory') only
+//     when every resident graph is busy (test/ann-evict.test.ts), and every namespace still answers queries
 //   * BUG-T2-S6-08 (fix round 2): only buildIndex is capped. A query (or a write) that must LOAD a persisted
 //     graph into a full handle table releases the least-recently-used idle graph of another namespace and
 //     loads again; it never throws max_graphs, never touches a stored record, and when every resident
@@ -167,7 +168,7 @@ describe('at most HNSW_MAX_GRAPHS graphs are loaded per store (BUG-T2-S6-03)', (
     expect(HNSW_MAX_GRAPHS).toBe(64);
   });
 
-  it('65 namespaces of 20 rows: the 65th buildIndex throws max_graphs and writes nothing; dropIndex of ns0 lets it build; every namespace still answers', async () => {
+  it('65 namespaces of 20 rows: the 65th buildIndex releases the least recently used idle graph and builds; writes only its own records; every namespace still answers', async () => {
     const events: Event[] = [];
     const driver = new Counting();
     const store = await createStore({ driver, events: { emit: (e) => void events.push(e) } });
@@ -177,17 +178,15 @@ describe('at most HNSW_MAX_GRAPHS graphs are loaded per store (BUG-T2-S6-03)', (
     const last = nsName(HNSW_MAX_GRAPHS);
     const before = driver.writes;
     events.length = 0;
-    const err = await store.buildIndex(last, PARAMS).catch((e: unknown) => e);
-    expect(err).toMatchObject({
-      code: 'quota_exceeded',
-      details: { reason: 'max_graphs', maxGraphs: HNSW_MAX_GRAPHS },
-    });
-    expect(driver.writes - before, 'a refused build writes nothing').toBe(0);
-    expect(await driver.keys(`${ANN_NS_PREFIX}${last}`)).toEqual([]);
-    const failed = events.find((e) => e.name === 'storage.index.build')!;
-    expect(failed.attrs['outcome']).toBe('quota_exceeded');
-    expect(failed.level).toBe('warn');
-    // the namespace without a graph answers flat, the 64 others answer from their graph
+    const built = await store.buildIndex(last, PARAMS);
+    expect(built).toMatchObject({ kind: 'hnsw', rows: 20, liveRows: 20, replaced: false });
+    expect(
+      driver.writes - before,
+      'params and graph; the evicted graph is neither deleted nor rewritten',
+    ).toBe(2);
+    const done = events.find((e) => e.name === 'storage.index.build')!;
+    expect(done.attrs['outcome']).toBe('ok');
+    // every namespace answers from its graph (the evicted one is loaded again from its stored record)
     for (let i = 0; i <= HNSW_MAX_GRAPHS; i++) {
       events.length = 0;
       const flat = await store.query(nsName(i), query(0), 5, { values: false });
@@ -197,19 +196,11 @@ describe('at most HNSW_MAX_GRAPHS graphs are loaded per store (BUG-T2-S6-03)', (
         nsName(i),
       ).toEqual(flat.map((h) => h.key));
       const q = events.filter((e) => e.name === 'storage.query').at(-1)!;
-      expect(q.attrs, nsName(i)).toMatchObject(
-        i < HNSW_MAX_GRAPHS
-          ? { index: 'hnsw', fallback: '' }
-          : { index: 'flat', fallback: 'absent' },
-      );
+      expect(q.attrs, nsName(i)).toMatchObject({ index: 'hnsw', fallback: '' });
     }
-    // dropIndex frees a slot: the same build now works
-    expect(await store.dropIndex(nsName(0), 'hnsw')).toBe(true);
-    const built = await store.buildIndex(last, PARAMS);
-    expect(built).toMatchObject({ kind: 'hnsw', rows: 20, liveRows: 20, replaced: false });
-    const q = await store.query(last, query(0), 5, { values: false, index: 'hnsw' });
-    expect(q).toHaveLength(5);
-    expect(events.filter((e) => e.name === 'storage.query').at(-1)!.attrs).toBeDefined();
+    // dropIndex of a resident namespace frees its slot; of a non-resident one it frees none
+    expect(await store.dropIndex(nsName(HNSW_MAX_GRAPHS), 'hnsw')).toBe(true);
+    expect(await driver.keys(`${ANN_NS_PREFIX}${last}`)).toEqual([]);
   }, 120_000);
 
   it('at the cap, buildIndex over a namespace that already has a resident graph replaces it', async () => {
@@ -493,7 +484,7 @@ describe('a query never throws because of the 64-handle cap (BUG-T2-S6-08)', () 
     ).toMatchObject({ index: 'hnsw', fallback: '' });
   }, 120_000);
 
-  it('T2 results unchanged: 80 namespaces built one after another, then all at once: 64 builds succeed and the other 16 throw max_graphs (builds only), then every query answers', async () => {
+  it('80 namespaces built one after another: all 80 succeed (idle graphs are released); built all at once: every result is ok or max_graphs, at least 64 are ok; then every query answers', async () => {
     const TOTAL = 80;
     for (const mode of ['sequential', 'concurrent'] as const) {
       const driver = new MemoryDriver();
@@ -508,15 +499,12 @@ describe('a query never throws because of the 64-handle cap (BUG-T2-S6-08)', () 
         );
       if (mode === 'sequential') for (let i = 0; i < TOTAL; i++) results.push(await build(i));
       else results.push(...(await Promise.all(Array.from({ length: TOTAL }, (_, i) => build(i)))));
-      expect(
-        results.filter((r) => r === 'ok'),
-        mode,
-      ).toHaveLength(HNSW_MAX_GRAPHS);
-      expect(
-        results.filter((r) => r === 'max_graphs'),
-        mode,
-      ).toHaveLength(TOTAL - HNSW_MAX_GRAPHS);
       expect(results, mode).toHaveLength(TOTAL);
+      const ok = results.filter((r) => r === 'ok').length;
+      const refused = results.filter((r) => r === 'max_graphs').length;
+      expect(ok + refused, `${mode}: no refusal other than max_graphs`).toBe(TOTAL);
+      if (mode === 'sequential') expect(ok, mode).toBe(TOTAL);
+      else expect(ok, mode).toBeGreaterThanOrEqual(HNSW_MAX_GRAPHS);
       // queries: no throw, flat-equal answers; graphs that exist answer from them, the others flat
       let thrown = 0;
       let differing = 0;
@@ -532,22 +520,15 @@ describe('a query never throws because of the 64-handle cap (BUG-T2-S6-08)', () 
     }
   }, 180_000);
 
-  it('buildIndex is still the only call the cap refuses: the 65th build throws max_graphs and writes nothing', async () => {
+  it('the 65th build over 64 idle graphs succeeds and the other namespaces keep answering from their graphs', async () => {
     const driver = new Counting();
     const store = await createStore({ driver });
     open.push(store);
     for (let i = 0; i <= HNSW_MAX_GRAPHS; i++) await store.putVectors(tinyNs(i), tinyRows(i));
     for (let i = 0; i < HNSW_MAX_GRAPHS; i++) await store.buildIndex(tinyNs(i), TINY_PARAMS);
     const before = driver.writes;
-    const err = await store
-      .buildIndex(tinyNs(HNSW_MAX_GRAPHS), TINY_PARAMS)
-      .catch((e: unknown) => e);
-    expect(err).toMatchObject({
-      code: 'quota_exceeded',
-      details: { reason: 'max_graphs', maxGraphs: HNSW_MAX_GRAPHS },
-    });
-    expect(driver.writes - before).toBe(0);
-    // queries on the 64 resident graphs keep answering from them
+    await store.buildIndex(tinyNs(HNSW_MAX_GRAPHS), TINY_PARAMS);
+    expect(driver.writes - before).toBe(2);
     expect(await ask(store, 5, 'hnsw')).toEqual(await ask(store, 5));
   }, 120_000);
 });

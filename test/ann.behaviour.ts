@@ -418,8 +418,11 @@ export const annCases: AnnCase[] = [
       }),
   },
   {
-    // BUG-T2-S6-02: 60 identical vectors make the graph return 34 hits for k = 50; the SDK answers flat.
-    name: 'many identical vectors: a short graph answer is replaced by the exact flat answer (fallback "short")',
+    // BUG-T2-S6-14 / S1-124 (TD-109): 30 copies of one vector, k = 50. Sprint 6: with 60 copies the graph returned
+    // 34 hits and the SDK answered flat with 'short'. Sprint 7: exact copies no longer fill every neighbour list,
+    // the group is reachable, and the graph itself returns the 50 flat scores (up to 2m = 32 copies; more makes the
+    // graph degenerate, next case).
+    name: 'many identical vectors: 30 copies of one vector, k = 50: the graph answers with the flat scores, bit for bit',
     run: (env) => {
       const events: Event[] = [];
       return withStore(env, { events: { emit: (e) => void events.push(e) } }, async (s) => {
@@ -434,7 +437,43 @@ export const annCases: AnnCase[] = [
                 key: `k${String(i).padStart(5, '0')}`,
                 vector: base.rows.slice(i * dim, (i + 1) * dim),
               };
-            for (let i = 0; i < 60; i++) yield { key: `dup${i}`, vector: one.slice() };
+            for (let i = 0; i < 30; i++) yield { key: `dup${i}`, vector: one.slice() };
+          })(),
+        );
+        await s.buildIndex(NS, { kind: 'hnsw', m: 16, efConstruction: 200, seed: 1 });
+        const flat = await s.query(NS, one, 50, { values: false });
+        eq(flat.length, 50, 'flat hits');
+        events.length = 0;
+        const hnsw = await s.query(NS, one, 50, { values: false, index: 'hnsw' });
+        deepEq(bitsOf(hnsw), bitsOf(flat), 'the flat scores, bit for bit');
+        const q = events.filter((e) => e.name === 'storage.query').at(-1)!;
+        eq(q.attrs['requested'], 'hnsw', 'requested');
+        eq(q.attrs['index'], 'hnsw', 'the graph answered');
+        eq(q.attrs['fallback'], '', 'fallback');
+        eq(q.attrs['ef'], 64, 'ef');
+      });
+    },
+  },
+  {
+    // TD-109 plan B: a group of exact copies larger than 2m (here 1000 > 32) makes the graph
+    // degenerate. The exact flat scan answers, with fallback 'duplicates', until the copies are gone and
+    // buildIndex is called again.
+    name: 'many identical vectors: 1000 copies (more than 2m) make the graph degenerate: the exact flat answer, fallback "duplicates"',
+    run: (env) => {
+      const events: Event[] = [];
+      return withStore(env, { events: { emit: (e) => void events.push(e) } }, async (s) => {
+        const dim = 32;
+        const base = clusteredSet(11, 40, dim, 5000, 1);
+        const one = synthVector(424_242, dim);
+        await s.putVectors(
+          NS,
+          (function* () {
+            for (let i = 0; i < 5000; i++)
+              yield {
+                key: `k${String(i).padStart(5, '0')}`,
+                vector: base.rows.slice(i * dim, (i + 1) * dim),
+              };
+            for (let i = 0; i < 1000; i++) yield { key: `dup${i}`, vector: one.slice() };
           })(),
         );
         await s.buildIndex(NS, { kind: 'hnsw', m: 16, efConstruction: 200, seed: 1 });
@@ -447,7 +486,7 @@ export const annCases: AnnCase[] = [
         const q = events.filter((e) => e.name === 'storage.query').at(-1)!;
         eq(q.attrs['requested'], 'hnsw', 'requested');
         eq(q.attrs['index'], 'flat', 'index');
-        eq(q.attrs['fallback'], 'short', 'fallback');
+        eq(q.attrs['fallback'], 'duplicates', 'fallback');
         eq(q.attrs['ef'], null, 'ef');
       });
     },

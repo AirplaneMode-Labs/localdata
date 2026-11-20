@@ -330,6 +330,7 @@ fn insert_after_a_cold_reload_equals_one_continuous_build() {
             rows: 800,
             generation: 3,
             ns: b"inc",
+            params: p,
         },
     )
     .unwrap();
@@ -473,7 +474,7 @@ fn deleted_rows_are_never_returned_and_a_reinserted_row_is_found() {
     // tombstones unchanged, a deleted row is still never returned.
     let mut bytes = g.serialize().unwrap();
     let ns_len = bytes[11] as usize;
-    let table = 56 + ns_len;
+    let table = 60 + ns_len;
     let count = get_u32(&bytes, 32) as usize;
     for i in 0..count {
         bytes[table + 8 * i + 5] = 0;
@@ -487,6 +488,7 @@ fn deleted_rows_are_never_returned_and_a_reinserted_row_is_found() {
             rows: n as u32,
             generation: 1,
             ns: b"del",
+            params: p,
         },
     )
     .unwrap();
@@ -523,6 +525,7 @@ fn the_empty_graph_round_trips_and_takes_its_first_insert() {
         rows: 0,
         generation: 0,
         ns: b"empty",
+        params: params(COSINE, 4, 20, 1),
     };
     let mut again = Graph::load(&bytes, &e).unwrap();
     assert_eq!(again.serialize().unwrap(), bytes);
@@ -559,6 +562,7 @@ fn an_empty_graph_of_a_namespace_without_a_dimension_is_valid_only_for_that_name
         rows: 0,
         generation: 0,
         ns: b"nodim",
+        params: params(COSINE, 4, 20, 1),
     };
     assert!(Graph::load(&bytes, &none).is_ok());
     let later = Expect {
@@ -566,6 +570,7 @@ fn an_empty_graph_of_a_namespace_without_a_dimension_is_valid_only_for_that_name
         rows: 20,
         generation: 3,
         ns: b"nodim",
+        params: params(COSINE, 4, 20, 1),
     };
     assert_eq!(Graph::load(&bytes, &later).err(), Some(Err::Dim));
     // a dimension above the format maximum is still refused, and nodes cannot be inserted without one
@@ -605,10 +610,17 @@ const DIM: usize = 8;
 const ROWS: usize = 60;
 const NS: &[u8] = b"fuzz.ns";
 const GEN: u32 = 5;
+/// The params `small()` builds with: what the namespace's stored params record would say.
+const SMALL_P: Params = Params {
+    metric: COSINE,
+    m: 4,
+    ef_construction: 20,
+    seed: 9,
+};
 
 fn small() -> (Vec<f32>, Vec<u8>) {
     let (vec, _) = synth::clustered(21, 4, DIM, ROWS, 1);
-    let g = build_all(&vec, DIM, &params(COSINE, 4, 20, 9), NS, GEN);
+    let g = build_all(&vec, DIM, &SMALL_P, NS, GEN);
     let bytes = g.serialize().unwrap();
     (vec, bytes)
 }
@@ -619,6 +631,7 @@ fn expect() -> Expect<'static> {
         rows: ROWS as u32,
         generation: GEN,
         ns: NS,
+        params: SMALL_P,
     }
 }
 
@@ -648,7 +661,7 @@ struct Layout {
 fn layout(b: &[u8]) -> Layout {
     let ns = b[11] as usize;
     let nodes = get_u32(b, 32) as usize;
-    let table = 56 + ns;
+    let table = 60 + ns;
     Layout {
         table,
         links: table + 8 * nodes,
@@ -700,8 +713,19 @@ fn the_header_checks_report_their_own_codes() {
     b[0] = b'X';
     assert_eq!(load_err(&b), Err::Magic);
     let mut b = good.clone();
-    b[8] = 2;
-    assert_eq!(load_err(&b), Err::Version);
+    b[8] = 1;
+    assert_eq!(
+        load_err(&b),
+        Err::Version,
+        "the first format's version field"
+    );
+    let mut b = good.clone();
+    b[8] = 3;
+    assert_eq!(load_err(&b), Err::Version, "a version from the future");
+    let mut b = good.clone();
+    b[0..8].copy_from_slice(b"LDHNSW01");
+    recrc(&mut b);
+    assert_eq!(load_err(&b), Err::Version, "the first format's magic");
     let mut b = good.clone();
     put_u32(&mut b, 12, DIM as u32 + 1);
     recrc(&mut b);
@@ -725,9 +749,39 @@ fn the_header_checks_report_their_own_codes() {
         assert_eq!(load_err(&b), Err::Bounds, "param at {off} = {bad}");
     }
     let mut b = good.clone();
-    put_u32(&mut b, 52, 1);
+    put_u32(&mut b, 52, ROWS as u32 + 1);
     recrc(&mut b);
-    assert_eq!(load_err(&b), Err::Bounds, "reserved header word");
+    assert_eq!(
+        load_err(&b),
+        Err::Bounds,
+        "a largest duplicate group above the node count"
+    );
+    let mut b = good.clone();
+    put_u32(&mut b, 52, ROWS as u32);
+    put_u32(&mut b, 56, ROWS as u32);
+    recrc(&mut b);
+    assert!(
+        load(&b).is_ok(),
+        "a group as large as the graph is a (forged or real) degenerate flag, not an error"
+    );
+    // the near-duplicate group (header word 56): above the node count, or below the exact group, is `bounds`
+    let mut b = good.clone();
+    put_u32(&mut b, 56, ROWS as u32 + 1);
+    recrc(&mut b);
+    assert_eq!(
+        load_err(&b),
+        Err::Bounds,
+        "a largest near-duplicate group above the node count"
+    );
+    let mut b = good.clone();
+    put_u32(&mut b, 52, 2);
+    put_u32(&mut b, 56, 1);
+    recrc(&mut b);
+    assert_eq!(
+        load_err(&b),
+        Err::Bounds,
+        "a near-duplicate group smaller than the exact group is impossible (identical rows share one key)"
+    );
     // a graph that is older than HEAD is valid (the caller calls it stale)
     let older = Graph::load(
         &good,
@@ -736,6 +790,7 @@ fn the_header_checks_report_their_own_codes() {
             rows: ROWS as u32 + 10,
             generation: GEN + 3,
             ns: NS,
+            params: SMALL_P,
         },
     );
     assert!(older.is_ok());
@@ -858,6 +913,7 @@ fn an_over_large_declared_count_with_a_short_file_is_a_negative_code_without_all
             rows: 4_194_304,
             generation: GEN,
             ns: NS,
+            params: SMALL_P,
         },
     );
     assert_eq!(e.err(), Some(Err::Length));
@@ -874,6 +930,7 @@ fn an_over_large_declared_count_with_a_short_file_is_a_negative_code_without_all
             rows: u32::MAX,
             generation: GEN,
             ns: NS,
+            params: SMALL_P,
         },
     );
     assert!(e.is_ok(), "the honest file still loads");
@@ -901,7 +958,7 @@ fn the_namespace_is_bound_by_its_bytes_not_by_a_checksum() {
         .serialize()
         .unwrap();
     // the namespace bytes are stored verbatim
-    assert_eq!(&bytes[56..56 + a.len()], &a[..]);
+    assert_eq!(&bytes[60..60 + a.len()], &a[..]);
     let e = |ns: &[u8]| {
         Graph::load(
             &bytes,
@@ -910,6 +967,7 @@ fn the_namespace_is_bound_by_its_bytes_not_by_a_checksum() {
                 rows: ROWS as u32,
                 generation: GEN,
                 ns,
+                params: params(COSINE, 4, 20, 9),
             },
         )
         .err()
@@ -980,6 +1038,9 @@ fn mutate(r: &mut SplitMix64, src: &[u8]) -> Vec<u8> {
     let mut v = src.to_vec();
     for _ in 0..1 + r.below(3) {
         match r.below(7) {
+            0 | 1 if v.is_empty() => {
+                // nothing left to flip or overwrite (an earlier step cut the file to nothing)
+            }
             0 => {
                 let i = r.below(v.len() as u64) as usize;
                 v[i] ^= 1 << r.below(8);

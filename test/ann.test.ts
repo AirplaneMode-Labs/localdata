@@ -260,6 +260,7 @@ describe('events (Event 0.1.5)', () => {
       dim: 16,
       m: 8,
       efConstruction: 40,
+      duplicateRows: 0,
     });
     expect(b.bytes).toBeGreaterThan(0);
     expect(b.durationMs).toBeGreaterThanOrEqual(0);
@@ -341,10 +342,12 @@ describe('events (Event 0.1.5)', () => {
   });
 });
 
-// BUG-T2-S6-02 (fix round 1): many identical vectors (boilerplate chunks embed identically) make the graph
-// return fewer than k hits (T2 measured 34 for k = 50 with 60, 200 or 1,000 copies, at ef 64 and 500). The
-// kernel is not changed this sprint (its graph bytes and determinism fixture stay as they are); the SDK
-// detects the short answer and answers with the exact flat scan, reporting fallback 'short'.
+// BUG-T2-S6-02 (fix round 1): many identical vectors (boilerplate chunks embed identically) made the graph
+// return fewer than k hits (a tester found 34 hits for k = 50 with 60, 200 or 1,000 copies, at ef 64 and 500), and the
+// SDK answered with the exact flat scan, reporting fallback 'short'. Sprint 7 (TD-109, BUG-T2-S6-14): the
+// kernel prunes exact copies by their bytes, so up to 2m (32 at m 16) copies of one vector are answered by the
+// graph itself; a group larger than 2m makes the graph degenerate and the exact flat scan answers
+// with fallback 'duplicates'. 'short' remains for a k the graph cannot fill (above ef) and as the safety net.
 describe('identical vectors: a short graph answer falls back to the flat scan', () => {
   const DIM = 32;
   const base = clusteredSet(11, 40, DIM, 5000, 1);
@@ -376,8 +379,24 @@ describe('identical vectors: a short graph answer falls back to the flat scan', 
   const bits = (hits: Array<{ key: string; score: number }>) =>
     hits.map((h) => [h.key, new Uint32Array(new Float32Array([h.score]).buffer)[0]]);
 
+  it('30 copies of one vector: k = 50 on hnsw is answered by the graph with the 50 flat scores (it was fallback short in Sprint 6)', async () => {
+    const { store, events } = await setup(30);
+    const flat = await store.query('dup', one, 50);
+    expect(flat).toHaveLength(50);
+    events.length = 0;
+    const hnsw = await store.query('dup', one, 50, { index: 'hnsw' });
+    expect(hnsw).toHaveLength(50);
+    expect(hnsw.map((h) => bits([h])[0]![1])).toEqual(flat.map((h) => bits([h])[0]![1]));
+    expect(lastQuery(events).attrs).toMatchObject({
+      requested: 'hnsw',
+      index: 'hnsw',
+      fallback: '',
+      ef: 64,
+    });
+  }, 120_000);
+
   for (const copies of [60, 1000]) {
-    it(`${copies} copies of one vector: k = 50 on hnsw returns the 50 flat hits and reports fallback 'short'`, async () => {
+    it(`${copies} copies of one vector (more than 2m = 32): the graph is degenerate, k = 50 returns the 50 flat hits and reports fallback 'duplicates'`, async () => {
       const { store, events } = await setup(copies);
       const flat = await store.query('dup', one, 50);
       expect(flat).toHaveLength(50);
@@ -388,13 +407,13 @@ describe('identical vectors: a short graph answer falls back to the flat scan', 
       expect(lastQuery(events).attrs).toMatchObject({
         requested: 'hnsw',
         index: 'flat',
-        fallback: 'short',
+        fallback: 'duplicates',
         ef: null,
       });
       // a wider ef does not change the story, and the answer is still the flat answer
       const wide = await store.query('dup', one, 50, { index: 'hnsw', ef: 500 });
       expect(bits(wide)).toEqual(bits(flat));
-      expect(lastQuery(events).attrs).toMatchObject({ index: 'flat', fallback: 'short' });
+      expect(lastQuery(events).attrs).toMatchObject({ index: 'flat', fallback: 'duplicates' });
     }, 120_000);
   }
 

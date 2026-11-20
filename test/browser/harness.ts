@@ -416,6 +416,8 @@ interface AnnBenchData {
   dim: number;
   centres: number;
   seed: number;
+  /** Every vector of the set is stored this many times under different keys (default 1: no copies). */
+  copies?: number;
 }
 const ANN_BENCH_NS = 'annbench';
 
@@ -432,10 +434,15 @@ function annBenchRows(d: AnnBenchData): Generator<{ key: string; vector: Float32
       d.seed,
       'data',
     );
+    const copies = Math.max(1, d.copies ?? 1);
+    let vector = new Float32Array(d.dim);
     for (let i = 0; i < d.rows; i++) {
-      const vector = new Float32Array(d.dim);
-      stream.nextInto(vector);
-      yield { key: synthKey(i), vector };
+      if (i % copies === 0) {
+        vector = new Float32Array(d.dim);
+        stream.nextInto(vector);
+      }
+      // the copies share the bytes of one vector (a separate array each: the writer may transfer it)
+      yield { key: synthKey(i), vector: copies === 1 ? vector : vector.slice() };
     }
   })();
 }
@@ -460,7 +467,14 @@ async function annBenchBuild(
   maxIndexBytes: number,
 ) {
   await reset(driver);
-  const store = await createStore({ driver, maxIndexBytes });
+  let duplicateRows = 0;
+  const events = {
+    emit: (e: Event) => {
+      if (e.name === 'storage.index.build' && typeof e.attrs['duplicateRows'] === 'number')
+        duplicateRows = e.attrs['duplicateRows'];
+    },
+  };
+  const store = await createStore({ driver, maxIndexBytes, events });
   try {
     let t0 = performance.now();
     await store.putVectors(ANN_BENCH_NS, annBenchRows(d));
@@ -468,7 +482,7 @@ async function annBenchBuild(
     t0 = performance.now();
     const built = await store.buildIndex(ANN_BENCH_NS, { kind: 'hnsw', ...hnsw });
     const buildMs = performance.now() - t0;
-    return { flatWriteMs, buildMs, graphBytes: built.bytes, nodes: built.rows };
+    return { flatWriteMs, buildMs, graphBytes: built.bytes, nodes: built.rows, duplicateRows };
   } finally {
     await store.close();
   }
@@ -492,13 +506,24 @@ async function annBenchCold(
   const timer = setInterval(sample, 10);
   // The sink only counts which index answered: a graph query that fell back to the flat scan would be a
   // wrong benchmark row, so the spec refuses any fallback.
-  const answered = { hnsw: 0, flat: 0, fallbacks: 0 };
+  const answered = { hnsw: 0, flat: 0, fallbacks: 0, duplicates: 0 };
+  // Per ef variant (the ground-truth flat pass has none): how many queries the graph answered, and how many
+  // the flat scan answered because the graph is degenerate (fallback 'duplicates').
+  let currentEf: number | null = null;
+  const perEf = new Map<number, { graph: number; duplicates: number }>();
   const events = {
     emit: (e: Event) => {
       if (e.name !== 'storage.query') return;
       if (e.attrs['index'] === 'hnsw') answered.hnsw++;
       else answered.flat++;
       if (e.attrs['fallback'] !== '') answered.fallbacks++;
+      if (e.attrs['fallback'] === 'duplicates') answered.duplicates++;
+      if (currentEf !== null) {
+        const c = perEf.get(currentEf) ?? { graph: 0, duplicates: 0 };
+        if (e.attrs['index'] === 'hnsw') c.graph++;
+        if (e.attrs['fallback'] === 'duplicates') c.duplicates++;
+        perEf.set(currentEf, c);
+      }
     },
   };
   const qs = annBenchQueries(d, queries);
@@ -517,6 +542,8 @@ async function annBenchCold(
   const run = async (ef: number | null) => {
     const lat: number[] = [];
     const keys: string[][] = [];
+    const scores: number[][] = [];
+    currentEf = ef;
     for (const q of qs) {
       const a = performance.now();
       const hits =
@@ -525,26 +552,55 @@ async function annBenchCold(
           : await store.query(ANN_BENCH_NS, q, 10, { values: false, index: 'hnsw', ef });
       lat.push(performance.now() - a);
       keys.push(hits.map((h) => h.key));
+      scores.push(hits.map((h) => h.score));
       sample();
     }
-    return { lat, keys };
+    currentEf = null;
+    return { lat, keys, scores };
   };
-  const variants: Array<{ ef: number | null; p50: number; p95: number; recall: number }> = [];
+  const variants: Array<{
+    ef: number | null;
+    p50: number;
+    p95: number;
+    recall: number;
+    /** Recall counted by score (copies tie): hits whose score is at least the flat scan's 10th best, over k. */
+    recallByScore: number;
+    /** Queries whose ten scores are, as a multiset and bit for bit, the flat scan's. */
+    equalToFlat: number;
+    answeredByGraph: number;
+    answeredByFlatDuplicates: number;
+  }> = [];
+  const bitsOf = (xs: number[]) =>
+    Array.from(new Uint32Array(new Float32Array(xs).buffer)).sort((a, b) => a - b);
   if (kind === 'hnsw') {
-    const results: Array<{ ef: number; lat: number[]; keys: string[][] }> = [];
+    const results: Array<{ ef: number; lat: number[]; keys: string[][]; scores: number[][] }> = [];
     for (const ef of efs) results.push({ ef, ...(await run(ef)) });
     // Ground truth: the flat scan of the same store, outside the timings above.
-    const truth = (await run(null)).keys;
+    const truthRun = await run(null);
+    const truth = truthRun.keys;
     for (const r of results) {
       let sum = 0;
-      for (let i = 0; i < r.keys.length; i++)
+      let byScore = 0;
+      let equal = 0;
+      for (let i = 0; i < r.keys.length; i++) {
         sum +=
           r.keys[i]!.filter((k) => truth[i]!.includes(k)).length / Math.max(1, truth[i]!.length);
+        const flatScores = truthRun.scores[i]!;
+        const kth = flatScores[flatScores.length - 1] ?? 0;
+        byScore += r.scores[i]!.filter((x) => x >= kth).length / Math.max(1, flatScores.length);
+        const a = bitsOf(r.scores[i]!);
+        const b = bitsOf(flatScores);
+        if (a.length === b.length && a.every((x, j) => x === b[j])) equal++;
+      }
       variants.push({
         ef: r.ef,
         p50: percentile(r.lat, 0.5),
         p95: percentile(r.lat, 0.95),
         recall: sum / r.keys.length,
+        recallByScore: byScore / r.keys.length,
+        equalToFlat: equal,
+        answeredByGraph: perEf.get(r.ef)?.graph ?? 0,
+        answeredByFlatDuplicates: perEf.get(r.ef)?.duplicates ?? 0,
       });
     }
   } else {
@@ -554,6 +610,10 @@ async function annBenchCold(
       p50: percentile(r.lat, 0.5),
       p95: percentile(r.lat, 0.95),
       recall: 1,
+      recallByScore: 1,
+      equalToFlat: r.keys.length,
+      answeredByGraph: 0,
+      answeredByFlatDuplicates: 0,
     });
   }
   // Memory is read BEFORE indexInfo: indexInfo loads the graph to report it, which would put the graph into
