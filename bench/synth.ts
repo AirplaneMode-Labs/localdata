@@ -220,5 +220,24 @@ export function clusteredSet(
   };
 }
 
+/**
+ * `count` uniform points in [-1, 1) of the stream: (z >> 44) - 2^19 over 2^19 (exact in binary32), one draw per
+ * component. The same bytes as `uniform` in crates/ldvec/tests/support/synth.rs.
+ */
+export function uniformPoints(
+  seed: number,
+  stream: 'data' | 'query',
+  count: number,
+  dim: number,
+): Float32Array {
+  const rng = new SplitMix64(STREAM_HI[stream], (seed ^ STREAM_LO[stream]) >>> 0);
+  const out = new Float32Array(count * dim);
+  for (let i = 0; i < out.length; i++) {
+    rng.next();
+    out[i] = ((rng.zh >>> 12) - (1 << 19)) / 524_288;
+  }
+  return out;
+}
+
 /** The fixed 10,000 x 384 clustered set of the recall floor (100 centres, 200 queries, seed 10,000). */
 export const RECALL_SET = { seed: 10_000, centres: 100, dim: 384, rows: 10_000, queries: 200 };

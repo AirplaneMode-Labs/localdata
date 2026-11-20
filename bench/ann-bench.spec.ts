@@ -7,8 +7,10 @@
 //     fresh page the flat queries, and in another fresh page the HNSW queries at ef 32, 64 and 128 with the
 //     recall@10 against the flat scan of the same store. 3 runs.
 //   uniform 100,000 x 384 (the worst case for any graph index), the same, 1 run, no floor.
+//   duplicates 100,000 x 384 clustered with every vector stored 30 times and 60 times (docs/benchmarks/ann-duplicates.csv,
+//     Sprint 7, TD-109): HNSW at ef 32, 64 and 128, 1 run each; recall is counted by score because copies tie;
 //   1,000,000 x 384 clustered (10,000 centres): attempted only if the 100,000 HNSW build took under 120 s,
-//     time-boxed to 30 minutes, one run; whether it ran, and why not if it did not, is written to
+//     time-boxed to 20 minutes, one run; whether it ran, and why not if it did not, is written to
 //     docs/benchmarks/ann-notes.json and stated in the README.
 //
 // Nothing in the CSV is typed by hand: commit is `git describe --always --dirty`, machine comes from
@@ -20,6 +22,7 @@
 // Environment (all optional):
 //   LOCALDATA_ANN_BENCH_CSV     CSV path (default docs/benchmarks/ann.csv)
 //   LOCALDATA_ANN_BENCH_NOTE    note path (default docs/benchmarks/ann-notes.json)
+//   LOCALDATA_ANN_DUP_BENCH_CSV duplicates CSV path (default docs/benchmarks/ann-duplicates.csv)
 //   LOCALDATA_ANN_BENCH_ROWS    rows of the "100k" sets (a dry run: 10000); the CSV then says so in `command`
 //   LOCALDATA_ANN_BENCH_SKIP_1M set to skip the 1M attempt
 //   LOCALDATA_BENCH_LOGS        a directory that receives raw.jsonl
@@ -30,11 +33,21 @@ import os from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, expect, test, type BrowserContext, type Page } from 'playwright/test';
-import { EIGHT_GB, annCsvHeader, annCsvRow } from '../scripts/bench-ann-readme.mjs';
+import {
+  ANN_CSV as ANN_CSV_DEFAULT,
+  ANN_DUP_CSV as ANN_DUP_CSV_DEFAULT,
+  EIGHT_GB,
+  annCsvHeader,
+  annCsvRow,
+  annDupCsvHeader,
+  annDupCsvRow,
+  hostLoadCell,
+} from '../scripts/bench-ann-readme.mjs';
 import { BASE_URL } from '../test/browser/playwright.config';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const CSV = process.env['LOCALDATA_ANN_BENCH_CSV'] ?? join(repo, 'docs', 'benchmarks', 'ann.csv');
+const CSV = process.env['LOCALDATA_ANN_BENCH_CSV'] ?? ANN_CSV_DEFAULT;
+const DUP_CSV = process.env['LOCALDATA_ANN_DUP_BENCH_CSV'] ?? ANN_DUP_CSV_DEFAULT;
 const NOTE =
   process.env['LOCALDATA_ANN_BENCH_NOTE'] ?? join(repo, 'docs', 'benchmarks', 'ann-notes.json');
 const LOGS = process.env['LOCALDATA_BENCH_LOGS'];
@@ -51,7 +64,11 @@ const QUERIES = 200;
 const EFS = [32, 64, 128];
 const HNSW = { m: 16, efConstruction: 200, seed: 1 };
 const GATE_1M_MS = 120_000;
-const TIMEBOX_1M_MS = 30 * 60_000;
+// Sprint 7 (TD-124): the 1M row is re-run only if it finishes within 20 minutes.
+const TIMEBOX_1M_MS = 20 * 60_000;
+// Sprint 7 (TD-109): every vector stored 30 times (a group within 2m = 32: the graph answers) and 60 times (more than
+// 2m: the graph is degenerate and the exact flat scan answers, fallback 'duplicates').
+const DUP_COPIES_LIST = [30, 60];
 const LAUNCH_ARGS = ['--enable-precise-memory-info'];
 
 interface Cfg {
@@ -130,6 +147,10 @@ async function oneRun(
   commit: string,
   facts: { chrome: string; precise: boolean },
 ): Promise<{ buildMs: number; flatWriteMs: number }> {
+  // The 1-minute load average before the run and after it (quiet slot Q2, TD-124); every row of the run carries
+  // both. '' on Windows, where the figure does not exist.
+  const loadStart = os.loadavg()[0] ?? Number.NaN;
+  const pending: Array<Record<string, unknown>> = [];
   const page = await openPage(ctx);
   const built = await page.evaluate(
     ([data, hnsw, max]) => window.__localdata.annBenchBuild('opfs', data, hnsw, max),
@@ -184,7 +205,7 @@ async function oneRun(
     ann_bytes: 0,
     storage_usage_bytes: flat.storageUsage,
   };
-  appendFileSync(CSV, annCsvRow(flatRow));
+  pending.push(flatRow);
   if (LOGS) appendFileSync(join(LOGS, 'raw.jsonl'), `${JSON.stringify({ flatRow, raw: flat })}\n`);
 
   const annPage = await openPage(ctx);
@@ -218,9 +239,19 @@ async function oneRun(
       ann_bytes: ann.annBytes,
       storage_usage_bytes: ann.storageUsage,
     };
-    appendFileSync(CSV, annCsvRow(row));
+    pending.push(row);
     if (LOGS) appendFileSync(join(LOGS, 'raw.jsonl'), `${JSON.stringify({ row, raw: ann })}\n`);
   }
+  const loadEnd = os.loadavg()[0] ?? Number.NaN;
+  for (const r of pending)
+    appendFileSync(
+      CSV,
+      annCsvRow({
+        ...r,
+        host_load_1m_start: hostLoadCell(os.platform(), loadStart),
+        host_load_1m_end: hostLoadCell(os.platform(), loadEnd),
+      }),
+    );
   console.log(
     `[bench:ann] ${cfg.label} run ${run}: flat write ${round(built.flatWriteMs)} ms, graph build ${round(built.buildMs)} ms (${built.graphBytes} bytes), ` +
       `flat p50 ${round(flat.variants[0]!.p50)} ms, hnsw ${ann.variants
@@ -253,6 +284,7 @@ async function runConfig(cfg: Cfg): Promise<number[]> {
 test.beforeAll(() => {
   mkdirSync(dirname(CSV), { recursive: true });
   writeFileSync(CSV, annCsvHeader());
+  writeFileSync(DUP_CSV, annDupCsvHeader());
   if (LOGS) mkdirSync(LOGS, { recursive: true });
 });
 
@@ -287,7 +319,113 @@ test(`uniform ${ROWS_100K} x ${DIM}: flat and HNSW, 1 run, no floor`, async () =
   });
 });
 
-test('1,000,000 x 384: only if the 100k graph build took under 120 s, time-boxed to 30 minutes', async () => {
+/** One duplicates run: every vector of the set stored `copies` times; HNSW at the efs, recall counted by score. */
+async function dupRun(
+  cfg: Cfg,
+  copies: number,
+  ctx: BrowserContext,
+  commit: string,
+  facts: { chrome: string; precise: boolean },
+) {
+  const loadStart = os.loadavg()[0] ?? Number.NaN;
+  const data = { ...cfgOf(cfg), copies };
+  const page = await openPage(ctx);
+  const built = await page.evaluate(
+    ([d, hnsw, max]) => window.__localdata.annBenchBuild('opfs', d, hnsw, max),
+    [data, HNSW, cfg.maxIndexBytes] as const,
+  );
+  await page.close();
+  expect(built.nodes).toBe(cfg.rows);
+  expect(built.duplicateRows, 'every copy after the first is a duplicate row').toBe(
+    cfg.rows - Math.ceil(cfg.rows / copies),
+  );
+  const annPage = await openPage(ctx);
+  const ann = await annPage.evaluate(
+    ([d, efs, q, max]) => window.__localdata.annBenchCold('opfs', d, 'hnsw', efs, q, max),
+    [data, EFS, QUERIES, cfg.maxIndexBytes] as const,
+  );
+  await annPage.close();
+  const loadEnd = os.loadavg()[0] ?? Number.NaN;
+  expect(ann.annCurrent, 'the graph is current').toBe(true);
+  for (const v of ann.variants) {
+    appendFileSync(
+      DUP_CSV,
+      annDupCsvRow({
+        commit,
+        date_utc: new Date().toISOString(),
+        machine,
+        os: osName,
+        chrome: facts.chrome,
+        precise_memory: facts.precise,
+        command: COMMAND,
+        driver: 'opfs',
+        kernel: ann.kernel,
+        data: cfg.data,
+        rows: cfg.rows,
+        dim: DIM,
+        copies_per_vector: copies,
+        m: HNSW.m,
+        ef_construction: HNSW.efConstruction,
+        ef_search: v.ef ?? '',
+        k: K,
+        seed: HNSW.seed,
+        queries: QUERIES,
+        run: 1,
+        build_ms: round(built.buildMs),
+        duplicate_rows: built.duplicateRows,
+        answered_by_graph: v.answeredByGraph,
+        answered_by_flat_duplicates: v.answeredByFlatDuplicates,
+        queries_equal_to_flat: v.equalToFlat,
+        recall_at_10_by_score: Math.round(v.recallByScore * 10000) / 10000,
+        query_p50_ms: round(v.p50),
+        query_p95_ms: round(v.p95),
+        index_bytes: ann.indexBytes,
+        ann_bytes: ann.annBytes,
+        eight_gb: EIGHT_GB,
+        host_load_1m_start: hostLoadCell(os.platform(), loadStart),
+        host_load_1m_end: hostLoadCell(os.platform(), loadEnd),
+      }),
+    );
+  }
+  console.log(
+    `[bench:ann] duplicates ${cfg.rows} x ${DIM} x${copies}: graph build ${round(built.buildMs)} ms (${built.graphBytes} bytes, ${built.duplicateRows} duplicate rows), ` +
+      ann.variants
+        .map(
+          (v) =>
+            `ef${v.ef} p50 ${round(v.p50)} ms equal ${v.equalToFlat}/${QUERIES} recall-by-score ${round(v.recallByScore)}`,
+        )
+        .join(', '),
+  );
+}
+
+for (const copies of DUP_COPIES_LIST) {
+  test(`duplicates ${ROWS_100K} x ${DIM}, every vector stored ${copies} times: HNSW (ef ${EFS.join(', ')}), 1 run, recall by score`, async () => {
+    test.setTimeout(3_600_000);
+    const cfg: Cfg = {
+      label: `duplicates-${ROWS_100K}-x${copies}`,
+      data: 'clustered',
+      rows: ROWS_100K,
+      // one centre per hundred base vectors, as the distinct clustered set has one per hundred rows
+      centres: Math.max(10, Math.round(ROWS_100K / copies / 100)),
+      seed: ROWS_100K + copies,
+      runs: 1,
+      maxIndexBytes: 2 ** 30,
+    };
+    const commit = git('describe', '--always', '--dirty');
+    const ctx = await launch(profileFor(cfg.label));
+    try {
+      const probe = await openPage(ctx);
+      const facts = await browserFacts(ctx, probe);
+      await probe.close();
+      expect(facts.precise, 'Chrome must run with --enable-precise-memory-info').toBe(true);
+      await dupRun(cfg, copies, ctx, commit, facts);
+    } finally {
+      await ctx.close().catch(() => undefined);
+    }
+  });
+}
+
+test('1,000,000 x 384: only if the 100k graph build took under 120 s, time-boxed to 20 minutes', async () => {
   test.setTimeout(TIMEBOX_1M_MS + 600_000);
   const buildS = median(clusteredBuilds) / 1000;
   if (SKIP_1M) {
