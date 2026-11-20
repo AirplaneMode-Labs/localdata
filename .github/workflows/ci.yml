@@ -93,3 +93,55 @@ jobs:
       - name: Check the preinstalled Google Chrome
         run: google-chrome --version || { echo "Google Chrome is not installed on this runner" >&2; exit 1; }
       - run: npm run test:browser
+
+  # Sprint 7 (B1, B2; TD-106, TD-118). The clean-install check and the test-key release rehearsal on the SAME artefacts:
+  # npm ci --ignore-scripts, the Rust kernel (cargo --locked), build, npm pack, install the tarball (not the source tree)
+  # into a fresh directory outside the checkout with no sibling repository, asserted calls on the memory backend including
+  # an HNSW query, then manifest, SHA256SUMS, a TEST 1 signature, the explicit-flag verification and the refusal proofs
+  # (scripts/release/rehearse.mjs). contents: read, no secret, no id-token, no cache of any kind (no setup-node cache, no
+  # rust-cache). It publishes nothing and the artefacts are short-lived (3 days) and named as rehearsals.
+  # Proves: the three-operating-system tarball install, LF SHA256SUMS, the Windows junction and symlink refusals of the
+  # release tool, and the README quick start run from the built tarball.
+  release-rehearsal:
+    name: release-rehearsal (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: '1.98'
+          targets: wasm32-unknown-unknown
+      - name: SOURCE_DATE_EPOCH from the commit (the rehearsal is reproducible)
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      - name: Rehearsal self-test (a missing, lying or signalled tool turns the proofs red)
+        shell: bash
+        run: node scripts/release/rehearse.mjs --self-test
+      # rehearse.mjs runs npm ci --ignore-scripts itself (the vitest step after it needs the dev tools it installs)
+      - name: Release rehearsal (clean install of the tarball, then the test-key rehearsal on the same artefacts)
+        shell: bash
+        run: node scripts/release/rehearse.mjs
+      - name: Quick start (the README blocks, run against a tarball built from this checkout) and the vendored release tool
+        shell: bash
+        run: npx vitest run test/quickstart.test.ts test/release-vectors.test.ts
+      - name: Upload the rehearsal artefacts (test key, NOT A RELEASE)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: REHEARSAL-test-key-NOT-A-RELEASE-localdata-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            dist-release/
+            dist-release-report/
+          include-hidden-files: false
+          retention-days: 3
+          if-no-files-found: error
