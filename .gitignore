@@ -24,4 +24,11 @@ coverage/
 # Rust and WASM build output (scripts/build-wasm.mjs); the embedded modules are generated, not tracked
 src/wasm/*.gen.ts
 *.wasm
+# a release manifest is output, except the five vendored release vectors (scripts/release/vectors/*/), which tests
+# read from a clean checkout (BUG-T2-S7-01): the negation on the next line must stay directly after this pattern
 release-manifest*.json
+!scripts/release/vectors/**/release-manifest.json
+
+# release rehearsal output (scripts/release/rehearse.mjs): the artefacts and the report, never committed
+dist-release/
+dist-release-report/

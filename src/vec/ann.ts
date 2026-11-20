@@ -26,24 +26,43 @@ import {
 } from '../contracts/storage-api';
 import type { DriverHooks } from '../drivers/types';
 import type { StorageEvents } from '../events';
-import { E_ARGS, E_HNSW_MEMORY, HNSW_INFO_WORDS, HNSW_REASONS, type Kernel } from './kernel';
+import {
+  E_ARGS,
+  E_HNSW_MEMORY,
+  HNSW_INFO_WORDS,
+  HNSW_REASONS,
+  KernelTrapError,
+  type Kernel,
+} from './kernel';
 import type { OpenIndex } from './reader';
 
 export const GRAPH_KEY = 'graph';
 export const PARAMS_KEY = 'params';
+/**
+ * The rebuild marker (Storage API 0.4.1): written when the SDK starts rebuilding a refused graph for HEAD
+ * generation G, so that a graph refused again at generation G, in this session or in a later one, is dropped
+ * instead of rebuilt a second time ('once per generation', TD-109, also for a graph of an older format).
+ */
+export const REBUILT_KEY = 'rebuilt';
 /** Size of the params record. */
 export const PARAMS_BYTES = 28;
+/** Size of the rebuild marker: magic 'LDHNSWR1', generation u32, CRC-32C of the first 12 bytes. */
+export const REBUILT_BYTES = 16;
 
 const ENC = new TextEncoder();
 const PARAMS_MAGIC = ENC.encode('LDHNSWP1');
+const REBUILT_MAGIC = ENC.encode('LDHNSWR1');
 
 /**
  * Why a request for 'hnsw' was answered by the flat scan ('' when the graph answered). 'short' (fix round 1):
  * the graph's live hits were fewer than min(k, live rows), for example with many identical vectors or a k
- * above HNSW_EF_MAX, so the exact flat scan answered.
+ * above HNSW_EF_MAX, so the exact flat scan answered. 'duplicates' (Sprint 7, TD-109 plan B, extended by TD-126):
+ * the graph is degenerate, a group of exact copies of one vector, or of rows that share one quantised key (the
+ * same vector up to float noise in the low twelve mantissa bits of every component), larger than 2m (a layer-0
+ * list), so the flat scan answered.
  */
 export type AnnFallback =
-  '' | 'absent' | 'stale' | 'filter' | 'metric' | 'short' | 'refused' | 'trap';
+  '' | 'absent' | 'stale' | 'filter' | 'metric' | 'short' | 'duplicates' | 'refused' | 'trap';
 
 /** The build parameters, as the kernel takes them (metric 0 = cosine, 1 = dot). */
 export interface AnnParams {
@@ -172,7 +191,25 @@ export function decodeParams(b: Uint8Array): AnnParams | undefined {
   return { metric: b[10] as 0 | 1, m, efConstruction, seed: dv.getUint32(20, true) };
 }
 
-// ---- the two driver records -------------------------------------------------------------------------
+export function encodeRebuilt(generation: number): Uint8Array {
+  const out = new Uint8Array(REBUILT_BYTES);
+  const dv = new DataView(out.buffer);
+  out.set(REBUILT_MAGIC, 0);
+  dv.setUint32(8, generation >>> 0, true);
+  dv.setUint32(12, crc32cSmall(out.subarray(0, 12)), true);
+  return out;
+}
+
+/** The generation of a rebuild marker, or undefined when the record is not exactly what encodeRebuilt writes. */
+export function decodeRebuilt(b: Uint8Array): number | undefined {
+  if (b.byteLength !== REBUILT_BYTES) return undefined;
+  for (let i = 0; i < 8; i++) if (b[i] !== REBUILT_MAGIC[i]) return undefined;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  if (dv.getUint32(12, true) !== crc32cSmall(b.subarray(0, 12))) return undefined;
+  return dv.getUint32(8, true);
+}
+
+// ---- the driver records -----------------------------------------------------------------------------
 
 export type GraphRead = { kind: 'ok'; bytes: Uint8Array } | { kind: 'absent' } | { kind: 'size' };
 
@@ -225,7 +262,7 @@ export class AnnFiles {
   /** Bytes the two records occupy, asked of the driver without reading them where it can say. */
   async size(): Promise<number> {
     let total = 0;
-    for (const key of [GRAPH_KEY, PARAMS_KEY]) {
+    for (const key of [GRAPH_KEY, PARAMS_KEY, REBUILT_KEY]) {
       try {
         if (typeof this.d.getBytesBounded === 'function') {
           const r = await this.d.getBytesBounded(this.ans, key, { max: 0 });
@@ -247,6 +284,32 @@ export class AnnFiles {
       if (e instanceof StorageError && e.code === 'corrupt') return true;
       throw e;
     }
+  }
+
+  /** The generation the rebuild marker names, or undefined when there is none (or it does not validate). */
+  async readRebuilt(): Promise<number | undefined> {
+    try {
+      const rec =
+        typeof this.d.getBytesBounded === 'function'
+          ? await this.d.getBytesBounded(this.ans, REBUILT_KEY, { max: 64 })
+          : undefined;
+      if (rec !== undefined) {
+        return rec.kind === 'ok' ? decodeRebuilt(rec.record.bytes) : undefined;
+      }
+      const plain = await this.d.getBytes(this.ans, REBUILT_KEY);
+      return plain === undefined ? undefined : decodeRebuilt(plain.bytes);
+    } catch (e) {
+      if (e instanceof StorageError && e.code === 'corrupt') return undefined;
+      throw e;
+    }
+  }
+
+  async putRebuilt(generation: number): Promise<void> {
+    await this.d.put(this.ans, REBUILT_KEY, encodeRebuilt(generation), { size: REBUILT_BYTES });
+  }
+
+  async delRebuilt(): Promise<void> {
+    await this.d.del(this.ans, REBUILT_KEY);
   }
 
   async putParams(bytes: Uint8Array): Promise<void> {
@@ -274,11 +337,27 @@ export interface AnnLoaded {
   nodes: number;
   liveNodes: number;
   generation: number;
+  /** The largest group of exact copies of one vector at the last count (header word 52). */
+  dupMax: number;
+  /** The largest group of rows that share one quantised key at the last count (header word 56; at least dupMax). */
+  nearMax: number;
   /** The graph record's length on the driver. */
   bytes: number;
 }
 
 export type AnnStatus = 'unknown' | 'absent' | 'loaded' | 'dropped';
+
+/**
+ * The degenerate rule of the kernel (`Graph::degenerate`, TD-109 and TD-126): the largest group of identical live
+ * rows, or the largest group of live rows that share one quantised key, is larger than 2m, the capacity of a layer-0
+ * neighbour list. The counts are the ones stored in the graph's header at the last build or put; they are not
+ * recounted when the graph is loaded (TD-127).
+ */
+export function annDegenerate(
+  g: Pick<AnnLoaded, 'dupMax' | 'nearMax'> & { params: { m: number } },
+): boolean {
+  return g.dupMax > 2 * g.params.m || g.nearMax > 2 * g.params.m;
+}
 
 export interface AnnState {
   readonly files: AnnFiles;
@@ -322,7 +401,8 @@ function memoryError(): StorageError {
  * The kernel keeps at most HNSW_MAX_GRAPHS graphs per instance (one instance per store) and reports a full
  * handle table with the same code as an exhausted heap. When this instance holds that many handles the
  * refusal is 'max_graphs'; otherwise it is the memory error it always was (BUG-T2-S6-03). Only a build
- * (buildIndex) refuses with it: a load makes room or reports 'busy' (BUG-T2-S6-08).
+ * (buildIndex) refuses with it, and only when every resident graph is busy: a build and a load both make
+ * room first (BUG-T2-S6-08, BUG-T2-S6-15), a load reporting 'busy' instead.
  */
 function exhaustedError(kernel: Kernel): StorageError {
   if (kernel.hnswLiveHandles(HNSW_MAX_GRAPHS) >= HNSW_MAX_GRAPHS) return maxGraphsError();
@@ -402,6 +482,8 @@ export interface AnnInfoWords {
   entry: number;
   maxLevel: number;
   serialisedBytes: number;
+  dupMax: number;
+  nearMax: number;
 }
 
 export interface AnnHit {
@@ -555,6 +637,8 @@ export class AnnManager {
         entry: w[8]!,
         maxLevel: w[9]!,
         serialisedBytes: w[10]! + w[11]! * 2 ** 32,
+        dupMax: w[12]!,
+        nearMax: w[13]!,
       };
     } finally {
       kernel.free(p, HNSW_INFO_WORDS * 4);
@@ -563,9 +647,11 @@ export class AnnManager {
 
   /**
    * Builds a graph over the live rows of `idx` (or an empty graph when the namespace has no flat index).
-   * Returns the kernel handle; the caller owns it. A full handle table is refused with 'max_graphs' (the
-   * normative buildIndex behaviour); only the SDK's own rebuild of a refused graph passes `evict`, which
-   * makes room by releasing the least recently used idle graph of another namespace first.
+   * Returns the kernel handle; the caller owns it. With `evict` (buildIndex and the SDK's own rebuild of a
+   * refused graph) a full handle table makes room by releasing the in-memory instance of the least recently
+   * used IDLE graph of another namespace and trying again (the stored records are never touched; TD-94 and
+   * TD-110, Storage API 0.4.1). It is refused with 'max_graphs' only when every resident graph is busy, or
+   * always without `evict`.
    */
   build(
     kernel: Kernel,
@@ -622,6 +708,59 @@ export class AnnManager {
     }
   }
 
+  /**
+   * Counts the duplicates among the live rows of `idx` (TD-109, TD-126): `rows` is the number of live rows whose
+   * vector bytes equal those of an earlier live row (the event attr duplicateRows), `maxGroup` the size of the
+   * largest group of identical live rows, `nearMax` the size of the largest group of live rows that share one
+   * quantised key. Counted in the kernel, by bytes. Returns undefined when it cannot be counted (the 8 bytes per
+   * live row it needs could not be reserved): the event then carries no figure rather than a wrong one. Never
+   * throws for that reason; a trap propagates.
+   */
+  duplicateStats(
+    kernel: Kernel,
+    idx: OpenIndex | undefined,
+  ): { rows: number; maxGroup: number; nearMax: number } | undefined {
+    if (idx === undefined || idx.liveRows === 0) return { rows: 0, maxGroup: 0, nearMax: 0 };
+    this.arm(kernel);
+    const lent = lend(kernel, idx, true);
+    let out = 0;
+    try {
+      out = kernel.alloc(12);
+      const rc = kernel.hnswDupStats(
+        lent.tablePtr,
+        lent.nBlocks,
+        idx.totalRows,
+        idx.dim,
+        lent.tombPtr,
+        lent.tombLen,
+        out,
+      );
+      if (rc !== 0) return undefined;
+      const w = kernel.u32(out, 3);
+      return { rows: w[0]!, maxGroup: w[1]!, nearMax: w[2]! };
+    } catch (e) {
+      if (e instanceof KernelTrapError) throw e;
+      return undefined;
+    } finally {
+      if (out !== 0) kernel.free(out, 12);
+      lent.free();
+    }
+  }
+
+  /**
+   * Recounts the largest group of identical live rows and the largest group that shares a quantised key after a
+   * put and records both in the graph (so the graph record carries them and `degenerate` stays true to the data).
+   * A count that cannot be made leaves the graph as it was.
+   */
+  recount(kernel: Kernel, idx: OpenIndex, g: AnnLoaded, handle = g.handle): void {
+    const st = this.duplicateStats(kernel, idx);
+    if (st === undefined) return;
+    const rc = kernel.hnswSetDupStats(handle, st.maxGroup, st.nearMax);
+    if (rc < 0) throw new AnnRefusedError(rc);
+    g.dupMax = st.maxGroup;
+    g.nearMax = st.nearMax;
+  }
+
   serialize(kernel: Kernel, handle: number): Uint8Array {
     const len = kernel.hnswSerializeLen(handle);
     if (len === E_HNSW_MEMORY) throw memoryError();
@@ -649,6 +788,8 @@ export class AnnManager {
       nodes: i.nodes,
       liveNodes: i.liveNodes,
       generation: i.generation,
+      dupMax: i.dupMax,
+      nearMax: i.nearMax,
       bytes,
     };
     s.g = g;
@@ -724,6 +865,7 @@ export class AnnManager {
           idx?.generation ?? 0,
           np,
           nsb.length,
+          params,
         );
       handle = call();
       if (handle === E_HNSW_MEMORY) handle = this.retryAfterEviction(ns, kernel, call);
@@ -764,6 +906,8 @@ export class AnnManager {
       nodes: i.nodes,
       liveNodes: i.liveNodes,
       generation: i.generation,
+      dupMax: i.dupMax,
+      nearMax: i.nearMax,
       bytes: bytes.byteLength,
     };
     s.g = g;

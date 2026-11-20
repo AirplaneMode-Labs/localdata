@@ -16,3 +16,12 @@
 *.ttf binary
 *.zip binary
 *.gz binary
+
+# The vendored release tool, its record, the vendored release vectors and every SHA256SUMS are hashed or signed
+# byte for byte: they are never converted (a CRLF checkout on Windows must not change a digest).
+scripts/release/release-tool.mjs -text
+scripts/release/VENDORED.json -text
+scripts/release/vectors/** -text
+SHA256SUMS -text
+**/SHA256SUMS -text
+*.sha256 -text

@@ -32,8 +32,10 @@ import {
   AnnManager,
   AnnRefusedError,
   PARAMS_BYTES,
+  REBUILT_BYTES,
   annRowEstimate,
   checkAnnQueryOptions,
+  annDegenerate,
   checkBuildOptions,
   encodeParams,
   metricName,
@@ -744,6 +746,7 @@ export class VectorStore {
       m: number;
       efc: number;
       bytes?: number;
+      dup?: number | undefined;
     } = {
       rows: 0,
       liveRows: 0,
@@ -772,9 +775,13 @@ export class VectorStore {
           reason = existed ? 'replace' : 'build';
           // A cheap lower bound first, so a hopeless build is refused before it runs.
           this.annQuotaCheck(ns, idx, 60 + 12 * (idx?.liveRows ?? 0));
-          const handle = this.ann.build(kernel, idx, ns, p);
+          // At HNSW_MAX_GRAPHS resident graphs the build releases the in-memory instance of the least recently
+          // used IDLE graph (the stored bytes stay) and throws max_graphs only when every resident graph is
+          // busy (Storage API 0.4.1, TD-110, BUG-T2-S6-15).
+          const handle = this.ann.build(kernel, idx, ns, p, true);
           let adopted = false;
           try {
+            st.dup = this.ann.duplicateStats(kernel, idx)?.rows;
             const bytes = this.ann.serialize(kernel, handle);
             const info = this.ann.info(kernel, handle);
             st.rows = info.nodes;
@@ -821,6 +828,7 @@ export class VectorStore {
         st.m,
         st.efc,
         st.bytes,
+        st.dup,
       );
     }
   }
@@ -952,6 +960,15 @@ export class VectorStore {
     const cur = e.idx ?? idx;
     if (g.generation < cur.generation) return { ok: false, fallback: 'stale' };
     if (g.params.metric !== metric) return { ok: false, fallback: 'metric' };
+    // Plan B of TD-109, extended by TD-126: a group of identical rows, or of rows that share one quantised key (the
+    // same vector up to float noise), larger than 2m (the capacity of a layer-0 list) means the graph cannot be
+    // trusted to find the nearest group (the search widening is capped, so the candidate list holds few distinct
+    // vectors). The exact flat scan answers, with fallback 'duplicates', until the group is removed and buildIndex
+    // is called again. The counts are the CRC-checked ones in the graph header and are NOT recounted at load: a
+    // forged RAISED count can only force this exact path, but a forged or lowered count CAN suppress the fallback
+    // (recall only: a score is always the flat scan's score for that row). Whoever can write the header can
+    // already replace the stored vectors, so this is the same trust boundary (BUG-T2-S7-03, S1-134, TD-127).
+    if (annDegenerate(g)) return { ok: false, fallback: 'duplicates' };
     return { ok: true, g, idx: cur };
   }
 
@@ -969,11 +986,24 @@ export class VectorStore {
       await this.annDrop(e.ns);
       return undefined;
     }
+    // The persisted marker (Storage API 0.4.1): a rebuild already started for this generation, in this session
+    // or an earlier one, so a graph refused again is dropped, never rebuilt a second time.
+    if ((await st.files.readRebuilt()) === gen) {
+      st.rebuiltAt.add(gen);
+      await this.annDrop(e.ns);
+      return undefined;
+    }
     st.rebuiltAt.add(gen);
     st.rebuilds++;
     const t0 = this.o.events.start();
     let outcome = 'ok';
-    const stats = { rows: 0, live: 0, dim: 0, bytes: undefined as number | undefined };
+    const stats = {
+      rows: 0,
+      live: 0,
+      dim: 0,
+      bytes: undefined as number | undefined,
+      dup: undefined as number | undefined,
+    };
     try {
       return await withWebLock(this.lockName(e.ns), async () => {
         const head = await this.refreshForWrite(e);
@@ -984,6 +1014,9 @@ export class VectorStore {
         await this.ensure(e, 'full', true);
         const idx = e.idx!;
         const kernel = await this.getKernel();
+        // The marker goes first: a rebuild that dies (a crashed tab, memory) must not be retried by the next
+        // session for the same generation. A write that fails is not fatal (the in-memory rule still holds).
+        await st.files.putRebuilt(gen).catch(() => undefined);
         // Built in memory first, so that a full handle table with every other graph in use is found out
         // before any stored record is touched.
         let handle: number;
@@ -994,19 +1027,25 @@ export class VectorStore {
             outcome = err.code;
             st.rebuiltAt.delete(gen);
             st.rebuilds--;
+            // Nothing was rebuilt: the marker is withdrawn, the rebuild does not count (BUG-T2-S6-08).
+            await st.files.delRebuilt().catch(() => undefined);
             return 'busy' as const;
           }
           throw err;
         }
         try {
           // The refused records go; the params come from memory (they were validated), the graph is built anew.
+          // The rebuild goes through the same pre-write checks as a fresh build: quota, maxIndexBytes (and the
+          // WebAssembly memory refusal of the build above).
           await st.files.clear();
           const bytes = this.ann.serialize(kernel, handle);
           const info = this.ann.info(kernel, handle);
+          stats.dup = this.ann.duplicateStats(kernel, idx)?.rows;
           stats.rows = info.nodes;
           stats.live = info.liveNodes;
           stats.dim = info.dim;
-          this.annQuotaCheck(e.ns, idx, bytes.byteLength);
+          this.annQuotaCheck(e.ns, idx, bytes.byteLength + REBUILT_BYTES);
+          await st.files.putRebuilt(gen);
           await st.files.putParams(encodeParams(params));
           await st.files.putGraph(bytes);
           stats.bytes = bytes.byteLength;
@@ -1042,6 +1081,7 @@ export class VectorStore {
         params.m,
         params.efConstruction,
         stats.bytes,
+        stats.dup,
       );
     }
   }
@@ -1101,6 +1141,8 @@ export class VectorStore {
         for (const row of out.replacedRows) this.ann.markDeleted(kernel, g, row);
         this.ann.insert(kernel, idx, g, out.firstNewRow, out.newRows);
         this.ann.setGeneration(kernel, g, idx.generation);
+        // The new rows may add copies: the largest group is counted again and written with the graph.
+        this.ann.recount(kernel, idx, g);
       }
       const handle = fresh ?? g.handle;
       try {

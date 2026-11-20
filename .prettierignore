@@ -17,3 +17,6 @@ Cargo.lock
 Cargo.toml
 rust-toolchain.toml
 *.rs
+# vendored from runtime spec 0.6.1, byte for byte (scripts/release/VENDORED.json)
+scripts/release/release-tool.mjs
+scripts/release/vectors/

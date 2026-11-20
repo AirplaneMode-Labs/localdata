@@ -1,0 +1,12 @@
+{
+  "source": "AirplaneMode-Labs/runtime spec/tools/release-tool.mjs",
+  "specRelease": "0.6.1",
+  "sha256": "81583057ea68b45890f8192e696418e59fb0faa8862a166dd37d3bd46b667387",
+  "vectors": {
+    "source": "AirplaneMode-Labs/runtime spec/vectors/release/",
+    "path": "scripts/release/vectors",
+    "files": 31,
+    "listingSha256": "54d78d44f73d43d9c89032200241241d2bca6f45240baf21f36b8f18cefc83e1",
+    "listing": "one line per file, sorted by path in byte order: '<sha256>  vectors/release/<path>' and an LF"
+  }
+}

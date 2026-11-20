@@ -184,7 +184,7 @@ export function renderBench(rows) {
   }
   lines.push('');
   lines.push(
-    "Memory budget (median / worst over the cold runs). `index bytes` is the index as written (HEAD, vectors, META with keys, value parts); `WASM memory` is the kernel instance's linear memory after the first query; `JS heap peak` is `performance.memory.usedJSHeapSize` sampled every 10 ms (approximate) over the first query plus the 50 queries that follow it, so it depends on GC timing and is not a cold-window peak (T1's probe read about 79.2 MB at the end of the first query on the 256-byte index and 163.8 MB after 50 more queries: `evidence/sprint-4/T1/results/heap-probe-cs256.json`); `storage usage` is `navigator.storage.estimate().usage` for the whole origin:",
+    "Memory budget (median / worst over the cold runs). `index bytes` is the index as written (HEAD, vectors, META with keys, value parts); `WASM memory` is the kernel instance's linear memory after the first query; `JS heap peak` is `performance.memory.usedJSHeapSize` sampled every 10 ms (approximate) over the first query plus the 50 queries that follow it, so it depends on GC timing and is not a cold-window peak (a Sprint 4 browser probe read about 79.2 MB at the end of the first query on the 256-byte index and 163.8 MB after 50 more queries: `evidence/sprint-4/T1/results/heap-probe-cs256.json`); `storage usage` is `navigator.storage.estimate().usage` for the whole origin:",
   );
   lines.push('');
   lines.push(

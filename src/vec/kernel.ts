@@ -50,17 +50,26 @@ export const HNSW_REASONS: Readonly<Record<number, string>> = Object.freeze({
   [-26]: 'bounds',
   [-27]: 'links',
   [-28]: 'crc',
+  [-29]: 'params',
 });
 /** Returned when an allocation inside the kernel failed (reported as quota_exceeded, 'wasm_memory'). */
 export const E_HNSW_MEMORY = -30;
 /** u32 words ldv_hnsw_info writes. */
-export const HNSW_INFO_WORDS = 12;
+export const HNSW_INFO_WORDS = 14;
 
 /** u32 words ldv_parse_head writes before the segment entries, and per entry. */
 export const HEAD_OUT_WORDS = 12;
 export const SEG_OUT_WORDS = 8;
 export const SEG_MAX = 4096;
 export const HEAD_OUT_BYTES = (HEAD_OUT_WORDS + SEG_OUT_WORDS * SEG_MAX) * 4;
+
+/** The namespace's stored params record, as the kernel compares a graph header with it. */
+export interface HnswStoredParams {
+  metric: number;
+  m: number;
+  efConstruction: number;
+  seed: number;
+}
 
 /** A trap inside the module: the instance is dead and must be discarded. */
 export class KernelTrapError extends Error {
@@ -119,7 +128,21 @@ interface Exports {
     headGeneration: number,
     nsPtr: number,
     nsLen: number,
+    metric: number,
+    m: number,
+    efConstruction: number,
+    seed: number,
   ): number;
+  ldv_hnsw_dup_stats(
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    dim: number,
+    tombPtr: number,
+    tombLen: number,
+    outPtr: number,
+  ): number;
+  ldv_hnsw_set_dup_stats(handle: number, maxGroup: number, nearMax: number): number;
   ldv_hnsw_info(handle: number, outPtr: number): number;
   ldv_hnsw_insert(
     handle: number,
@@ -385,6 +408,11 @@ export class Kernel {
     );
   }
 
+  /**
+   * Validates and loads a graph. `params` is the namespace's stored params record (metric 0 cosine / 1 dot,
+   * m, efConstruction, seed): the kernel refuses a header that says anything else with code -29 ('params')
+   * before it reserves anything sized by a header field (S1-123, S1-128).
+   */
   hnswLoad(
     ptr: number,
     len: number,
@@ -393,12 +421,56 @@ export class Kernel {
     headGeneration: number,
     nsPtr: number,
     nsLen: number,
+    params: HnswStoredParams,
   ): number {
     assertU32(len, 'graph length');
     assertU32(rows, 'rows');
     return this.callHnsw(() =>
-      this.x.ldv_hnsw_load(ptr, len, dim, rows, headGeneration, nsPtr, nsLen),
+      this.x.ldv_hnsw_load(
+        ptr,
+        len,
+        dim,
+        rows,
+        headGeneration,
+        nsPtr,
+        nsLen,
+        params.metric,
+        params.m,
+        params.efConstruction,
+        params.seed,
+      ),
     );
+  }
+
+  /**
+   * Counts exact and near duplicates among the live rows (TD-109, TD-126): writes three u32 words to `outPtr`,
+   * [rows whose bytes equal an earlier live row's, size of the largest group of identical live rows, size of the
+   * largest group that shares one quantised key (every component's bits with the low twelve mantissa bits
+   * cleared)]. Returns 0, or a negative code (E_HNSW_MEMORY when the 8 bytes per live row it needs could not be
+   * reserved). Same block table and tombstone arguments as hnswBuild.
+   */
+  hnswDupStats(
+    tablePtr: number,
+    nBlocks: number,
+    total: number,
+    dim: number,
+    tombPtr: number,
+    tombLen: number,
+    outPtr: number,
+  ): number {
+    assertU32(total, 'rows');
+    return this.callHnsw(() =>
+      this.x.ldv_hnsw_dup_stats(tablePtr, nBlocks, total, dim, tombPtr, tombLen, outPtr),
+    );
+  }
+
+  /**
+   * Records a fresh count in the graph (written into its header): the largest group of identical live rows and the
+   * largest group that shares a quantised key. A near count below the exact count is impossible and is refused by
+   * the kernel (a negative code, the graph as it was).
+   */
+  hnswSetDupStats(handle: number, maxGroup: number, nearMax: number): number {
+    return this.callHnsw(() => this.x.ldv_hnsw_set_dup_stats(handle, maxGroup, nearMax));
   }
 
   hnswInfo(handle: number, outPtr: number): number {

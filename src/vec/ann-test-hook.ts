@@ -46,3 +46,26 @@ export function armVectorTrap(store: LocalData, afterCalls = 0): void {
 export function annStats(store: LocalData, ns: string): { rebuilds: number } {
   return { rebuilds: inner(store).ann.state(ns).rebuilds };
 }
+
+/** True when `ns` has a graph resident in this store's kernel (a handle in the table). */
+export function annResident(store: LocalData, ns: string): boolean {
+  return inner(store).ann.state(ns).g !== undefined;
+}
+
+/** How many namespaces of this store hold a resident graph (handles in the kernel's table). */
+export function annResidentCount(store: LocalData): number {
+  const ann = inner(store).ann as unknown as { states: Map<string, { g: unknown }> };
+  let n = 0;
+  for (const s of ann.states.values()) if (s.g !== undefined) n++;
+  return n;
+}
+
+/**
+ * MUTATION, for the eviction tests only: the store forgets that a namespace with a running or queued operation
+ * is busy, so the eviction picks the least recently used graph whoever is using it. A test that must go red
+ * under this mutation proves that the guard it protects is the thing keeping it green.
+ */
+export function removeBusyGuardForTest(store: LocalData): void {
+  const o = (inner(store).ann as unknown as { o: { busy: (ns: string) => boolean } }).o;
+  o.busy = () => false;
+}

@@ -11,6 +11,6 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 # Zero dependencies on purpose (build-or-adopt rules TD-17 and TD-65): the flat scan, the on-disk
-# validation and the in-house HNSW graph (about 1,050 lines in src/hnsw.rs; about 2,200 lines under src/ in
+# validation and the in-house HNSW graph (about 1,300 lines in src/hnsw.rs; about 2,500 lines under src/ in
 # all) are all a buyer has to audit, and no third-party crate enters the tree.
 [dependencies]

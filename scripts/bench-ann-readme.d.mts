@@ -12,3 +12,13 @@ export function renderAnnBench(
   note?: { oneMillion?: { statement: string } },
 ): string;
 export function readAnnNote(path?: string): { oneMillion?: { statement: string } } | undefined;
+export const ANN_DUP_COLUMNS: string[];
+export const ANN_DUP_CSV: string;
+export const DUP_BEGIN: string;
+export const DUP_END: string;
+export const LOAD_LIMIT: number;
+export const UNDER_LOAD: string;
+export function annDupCsvHeader(): string;
+export function annDupCsvRow(o: Record<string, string | number | boolean>): string;
+export function hostLoadCell(platform: string, load: number): string;
+export function renderAnnDup(rows: Array<Record<string, string>>): string;

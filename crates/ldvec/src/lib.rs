@@ -319,7 +319,7 @@ use std::cell::RefCell;
 const HANDLES_MAX: usize = 64;
 const BLOCKS_MAX: u32 = 1 << 16;
 /// u32 words `ldv_hnsw_info` writes.
-pub const HNSW_INFO_WORDS: u32 = 12;
+pub const HNSW_INFO_WORDS: u32 = 14;
 
 thread_local! {
     static GRAPHS: RefCell<Vec<Option<hnsw::Graph>>> = const { RefCell::new(Vec::new()) };
@@ -450,9 +450,11 @@ pub extern "C" fn ldv_hnsw_build(
 }
 
 /// Validates and loads a serialised graph at `[ptr, ptr + len)` for a namespace of `dim` components whose
-/// flat HEAD has `rows` rows at `head_generation`, named by the UTF-8 bytes at `ns_ptr`. Returns a handle
-/// (> 0) or a negative code (-20 to -28 for a refused file, -30 for memory, -100 for arguments).
+/// flat HEAD has `rows` rows at `head_generation`, named by the UTF-8 bytes at `ns_ptr`, and whose stored
+/// params record says `metric`, `m`, `ef_construction` and `seed`. Returns a handle (> 0) or a negative code
+/// (-20 to -29 for a refused file, -30 for memory, -100 for arguments).
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn ldv_hnsw_load(
     ptr: u32,
     len: u32,
@@ -461,16 +463,28 @@ pub extern "C" fn ldv_hnsw_load(
     head_generation: u32,
     ns_ptr: u32,
     ns_len: u32,
+    metric: u32,
+    m: u32,
+    ef_construction: u32,
+    seed: u32,
 ) -> i32 {
     // SAFETY: range-checked views.
     let (Some(b), Some(ns)) = (unsafe { bytes(ptr, len) }, unsafe { bytes(ns_ptr, ns_len) }) else {
         return E_ARGS;
     };
+    // The namespace's stored params record, read by the host: the header must say the same (-29 when it does
+    // not), and that is checked before anything sized by the header is reserved (S1-123, S1-128).
     let e = hnsw::Expect {
         dim,
         rows,
         generation: head_generation,
         ns,
+        params: hnsw::Params {
+            metric,
+            m,
+            ef_construction,
+            seed,
+        },
     };
     match hnsw::Graph::load(b, &e) {
         Ok(g) => register(g),
@@ -478,8 +492,62 @@ pub extern "C" fn ldv_hnsw_load(
     }
 }
 
+/// Counts exact and near duplicates among the live rows of the block table `[table_ptr, n_blocks]` (`total` rows
+/// of `dim` components) and the HEAD tombstone bitset (`tomb_len` 0 for none): writes three u32 words to `out_ptr`,
+/// `[rows whose bytes equal an earlier live row's, size of the largest group of identical live rows, size of the
+/// largest group that shares a quantised key]` (TD-126).
+/// Returns 0, or a negative code: -100 for arguments, -30 when the 8 bytes per live row it needs could not be
+/// reserved.
+#[no_mangle]
+pub extern "C" fn ldv_hnsw_dup_stats(
+    table_ptr: u32,
+    n_blocks: u32,
+    total: u32,
+    dim: u32,
+    tomb_ptr: u32,
+    tomb_len: u32,
+    out_ptr: u32,
+) -> i32 {
+    // SAFETY: the table and every view in it are checked; the bitset and the output are range-checked.
+    let rows = match unsafe { rows_from_table(table_ptr, n_blocks, total, dim) } {
+        Ok(r) => r,
+        Err(c) => return c,
+    };
+    let (Some(tomb), Some(out)) = (unsafe { bytes(tomb_ptr, tomb_len) }, unsafe {
+        floats_mut(out_ptr, 3)
+    }) else {
+        return E_ARGS;
+    };
+    match hnsw::duplicate_stats(&rows, tomb) {
+        Ok(st) => {
+            // SAFETY: f32 and u32 have the same size and alignment; the words are written as bit patterns.
+            let w: &mut [u32] =
+                unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u32, out.len()) };
+            w[0] = st.rows;
+            w[1] = st.max_group;
+            w[2] = st.near_max;
+            0
+        }
+        Err(e) => e as i32,
+    }
+}
+
+/// Records a fresh count (see `ldv_hnsw_dup_stats`) in the graph, which writes it into its header: the largest
+/// group of identical live rows and the largest group that shares a quantised key. A graph for which either exceeds
+/// 2 * m is degenerate. A near count below the exact count is impossible and returns -26 (bounds), leaving the
+/// graph as it was.
+#[no_mangle]
+pub extern "C" fn ldv_hnsw_set_dup_stats(handle: u32, max_group: u32, near_max: u32) -> i32 {
+    match with_graph(handle, false, |g| {
+        g.set_dup_stats(max_group, near_max).map_err(|e| e as i32)
+    }) {
+        Ok(()) => 0,
+        Err(c) => c,
+    }
+}
+
 /// Writes `HNSW_INFO_WORDS` u32 words to `out_ptr`: `[metric, m, efConstruction, seed, dim, nodes, liveNodes,
-/// generation, entry (0xFFFFFFFF when empty), maxLevel, serialisedLenLo, serialisedLenHi]`.
+/// generation, entry (0xFFFFFFFF when empty), maxLevel, serialisedLenLo, serialisedLenHi, dupMax, nearMax]`.
 #[no_mangle]
 pub extern "C" fn ldv_hnsw_info(handle: u32, out_ptr: u32) -> i32 {
     // SAFETY: range- and alignment-checked view.
@@ -504,6 +572,8 @@ pub extern "C" fn ldv_hnsw_info(handle: u32, out_ptr: u32) -> i32 {
         w[9] = g.max_level();
         w[10] = n as u32;
         w[11] = (n >> 32) as u32;
+        w[12] = g.dup_max();
+        w[13] = g.near_max();
         Ok(())
     }) {
         Ok(()) => 0,

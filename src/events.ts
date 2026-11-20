@@ -107,7 +107,8 @@ export const REDACTED_PREFIXES_MAX = 16;
 export interface QueryAnnAttrs {
   requested: 'flat' | 'hnsw';
   index: 'flat' | 'hnsw';
-  fallback: '' | 'absent' | 'stale' | 'filter' | 'metric' | 'short' | 'refused' | 'trap';
+  fallback:
+    '' | 'absent' | 'stale' | 'filter' | 'metric' | 'short' | 'duplicates' | 'refused' | 'trap';
   ef: number | null;
 }
 const FLAT_QUERY: QueryAnnAttrs = { requested: 'flat', index: 'flat', fallback: '', ef: null };
@@ -227,7 +228,8 @@ export class StorageEvents {
   /**
    * storage.index.build (Event 0.1.5): a buildIndex() call ('build' on a namespace without a graph,
    * 'replace' over one) or the SDK's rebuild of a refused graph ('rebuild'). `bytes` is the graph bytes
-   * written. Never a key, a vector, a score or the seed.
+   * written. Since Event 0.1.6 also `duplicateRows` (live rows whose vector bytes equal an earlier live row's),
+   * when it could be counted. Never a key, a vector, a score or the seed.
    */
   indexBuild(
     startedAt: number,
@@ -240,6 +242,7 @@ export class StorageEvents {
     m: number,
     efConstruction: number,
     bytes?: number,
+    duplicateRows?: number,
   ): void {
     this.timing(
       'storage.index.build',
@@ -248,7 +251,16 @@ export class StorageEvents {
       outcome,
       outcome === 'ok' ? 'debug' : 'warn',
       bytes,
-      { kind: 'hnsw', reason, rows, liveRows, dim, m, efConstruction },
+      {
+        kind: 'hnsw',
+        reason,
+        rows,
+        liveRows,
+        dim,
+        m,
+        efConstruction,
+        ...(duplicateRows === undefined ? {} : { duplicateRows }),
+      },
     );
   }
 
