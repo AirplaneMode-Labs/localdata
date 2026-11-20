@@ -19,7 +19,7 @@
         page's own files.
       </p>
       <!-- prettier-ignore -->
-      <p class="status-line" id="sprint-status">Sprint 6 (19 Nov 2026): Working: an optional HNSW graph behind the Storage API (buildIndex, query with index "hnsw" and ef; flat stays the default and the fallback; the graph is stored on OPFS, IndexedDB or memory, validated on every read and rebuilt from the stored vectors when it is refused), built in-house in the Rust ldvec crate with no new dependency and shown here against the flat scan on the same seeded data, in Chrome on an Apple M5 Pro with 48 GB (not measured on 8 GB). Not yet: quantisation, compaction, encryption at rest, HNSW for queryChunks, an 8 GB measurement.</p>
+      <p class="status-line" id="sprint-status">Sprint 7 (20 Nov 2026): Working: HNSW over repeated vectors: the Rust kernel prunes exact copies by their bytes (graph format LDHNSW02), and with up to 32 exact copies of a vector (2m at the default m of 16) at least 99 of 100 queries return the flat scan's scores in the measured synthetic sets (100,000 x 384 with every vector stored 30 times: 200 of 200 queries equal to flat at ef 64, build 50 s, graph 11.7 MB, in Chrome on an Apple M5 Pro with 48 GB); above that, or when more than 32 vectors agree except in the low 12 mantissa bits of every component, the exact flat scan answers with the fallback "duplicates"; a build at the 64-graph cap releases the least recently used idle graph; a forged graph header is refused before anything is reserved; and the release path is rehearsed locally on macOS (a clean install of the packed tarball, a test-key signature, every refusal proven by exact exit code), with a CI job for Linux, macOS and Windows that has not run yet, a publish workflow only the owner can start and a quick start that a test runs (not measured on 8 GB). Not yet: wider tight clusters are not detected (on synthetic dimension-384 sets with a relative spread from about 1e-5 per component (about 256 ulp) the rule did not fire and the graph alone matched the flat scan on 92 to 99 of 100 queries, so use flat when completeness matters), quantisation, compaction, encryption at rest, HNSW for queryChunks, a batched delete, a tag or a publish (owner steps), an 8 GB measurement.</p>
       <p class="status-line" id="build-line">
         <code id="build-sha" data-build="__BUILD_ID__">Local build local</code>
       </p>
@@ -58,8 +58,8 @@
         <ul>
           <li>
             Not yet: quantisation, compaction, encryption at rest, HNSW for
-            <code>queryChunks</code> (the documents API stays a flat scan), and a measurement on an
-            8 GB laptop (not measured on 8 GB).
+            <code>queryChunks</code> (the documents API stays a flat scan), a batched delete, and a
+            measurement on an 8 GB laptop (not measured on 8 GB).
           </li>
           <li>
             There is no compaction: deleting a document hides its chunks from every query but the
@@ -72,6 +72,18 @@
             for its own 20,000 rows. The figures on this page are measured in this tab on this
             device; the README figures are from an Apple M5 Pro 48 GB and nothing here is an 8 GB
             figure.
+          </li>
+          <li>
+            A graph over very many exact copies of one vector is not promised to reach every copy:
+            above 2m (32 at the default m) copies of one vector, or of vectors that are the same up
+            to float noise in the low 12 mantissa bits of every component, the graph is degenerate
+            and the exact flat scan answers instead (slower, never wrong). Wider tight clusters are
+            not detected: on synthetic clusters with a relative spread of 1e-4 or more per component
+            the graph alone returned scores below the flat scan's for some queries, so use flat when
+            completeness matters. Detection depends on the data and the dimension: all-component
+            float noise of about 1e-5 relative at dim 384 was not detected on a synthetic set.
+            Nothing here is published: the npm scope and package name are not reserved, and nothing
+            is signed with a real key.
           </li>
           <li>
             The documents on this page are three synthetic, made-up documents with seeded vectors.
@@ -248,12 +260,18 @@
       <section id="ann" class="box">
         <h2>Flat or HNSW, on the same seeded data</h2>
         <!-- prettier-ignore -->
-        <p>A seeded clustered set of 20,000 rows of dimension 384 (the integer-only generator of bench/synth.ts, the same bytes in Rust and TypeScript; no real documents and no model), written with <code>putVectors</code> into the namespace <code>demo-ann</code>, then indexed with <code>buildIndex</code> (HNSW, m 16, efConstruction 200, seed 1). The switch flips <code>query()</code> between <code>index: 'flat'</code> and <code>index: 'hnsw'</code> over 50 seeded queries; for HNSW the page also runs the flat scan afterwards to count how many of the exact top 10 the graph found.</p>
+        <p>A seeded clustered set of 20,000 rows of dimension 384 (the integer-only generator of bench/synth.ts, the same bytes in Rust and TypeScript; no real documents and no model), written with <code>putVectors</code> into the namespace <code>demo-ann</code>, then indexed with <code>buildIndex</code> (HNSW, m 16, efConstruction 200, seed 1). The switch flips <code>query()</code> between <code>index: 'flat'</code> and <code>index: 'hnsw'</code> over 50 seeded queries; for HNSW the page also runs the flat scan afterwards to count how many of the exact top 10 the graph found (by score, because exact copies of one vector tie). Pick the data first: every vector stored 20 times is the repeated-boilerplate case that Sprint 6 got wrong and Sprint 7 fixed in the kernel (the graph answers and equals the flat scan); one vector stored 300 times is a group larger than 2m (32), which makes the graph degenerate, and the exact flat scan answers with the fallback <code>duplicates</code>.</p>
         <p id="ann-warning" class="muted">
           This set uses about <span id="ann-mb">__ANN_MB__</span> MB of this browser's storage
           (shared with other Airplane Mode Labs demos on this origin); Delete index removes it.
         </p>
         <div class="row">
+          <label for="ann-data">Data</label>
+          <select id="ann-data">
+            <option value="clustered" selected>20,000 distinct rows</option>
+            <option value="copies">1,000 vectors, each stored 20 times</option>
+            <option value="many">distinct rows plus one vector stored 300 times</option>
+          </select>
           <button id="ann-build" type="button">Build (20,000 rows and the graph)</button>
           <label for="ann-kind">Index kind</label>
           <select id="ann-kind">
@@ -264,6 +282,7 @@
         </div>
         <div class="row">
           <button id="ann-corrupt" type="button">Corrupt the graph</button>
+          <button id="ann-old-format" type="button">Make the graph an old-format file</button>
           <button id="ann-reload" type="button">Reload page</button>
           <button id="ann-delete" type="button">Delete index</button>
         </div>
@@ -283,12 +302,16 @@
               <td id="ann-time">-</td>
             </tr>
             <tr>
-              <th scope="row">Recall@10 against the flat scan (50 queries)</th>
+              <th scope="row">Recall@10 against the flat scan, counted by score (50 queries)</th>
               <td id="ann-recall">-</td>
             </tr>
             <tr>
               <th scope="row">Graph bytes (annBytes), flat index bytes</th>
               <td id="ann-bytes">-</td>
+            </tr>
+            <tr>
+              <th scope="row">Exact duplicate rows at the last build (duplicateRows)</th>
+              <td id="ann-dup">-</td>
             </tr>
             <tr>
               <th scope="row">Graph events</th>
@@ -297,7 +320,7 @@
           </tbody>
         </table>
         <!-- prettier-ignore -->
-        <p class="muted">Corrupt the graph truncates the graph record of the namespace demo-ann only (never the vectors); the next HNSW query refuses it, rebuilds it from the stored vectors and answers, and the events line shows both. Measured in this tab on this device; the README figures are from an Apple M5 Pro 48 GB; not measured on 8 GB.</p>
+        <p class="muted">Corrupt the graph truncates the graph record of the namespace demo-ann only (never the vectors); the next HNSW query refuses it, rebuilds it from the stored vectors and answers, and the events line shows both. "Make the graph an old-format file" rewrites that record as a graph of the first format (magic LDHNSW01, as 0.4.0-alpha.0 wrote it): the next HNSW query refuses it with the reason <code>version</code> and rebuilds it from the stored vectors. The SDK rebuilds a refused graph at most once per generation (a marker is stored beside the graph), so a second damage after a rebuild is refused and the index is dropped, not rebuilt: press Build to start again. Measured in this tab on this device; the README figures are from an Apple M5 Pro 48 GB; not measured on 8 GB.</p>
       </section>
 
       <section id="documents" class="box">

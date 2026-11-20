@@ -98,10 +98,12 @@ const ui = {
   vecBytes: el<HTMLTableCellElement>('vec-bytes'),
   vecMatch: el<HTMLTableCellElement>('vec-match'),
   vecHits: el<HTMLOListElement>('vec-hits'),
+  annData: el<HTMLSelectElement>('ann-data'),
   annBuild: el<HTMLButtonElement>('ann-build'),
   annKind: el<HTMLSelectElement>('ann-kind'),
   annRun: el<HTMLButtonElement>('ann-run'),
   annCorrupt: el<HTMLButtonElement>('ann-corrupt'),
+  annOldFormat: el<HTMLButtonElement>('ann-old-format'),
   annReload: el<HTMLButtonElement>('ann-reload'),
   annDelete: el<HTMLButtonElement>('ann-delete'),
   annStatus: el<HTMLParagraphElement>('ann-status'),
@@ -111,6 +113,7 @@ const ui = {
   annTime: el<HTMLTableCellElement>('ann-time'),
   annRecall: el<HTMLTableCellElement>('ann-recall'),
   annBytes: el<HTMLTableCellElement>('ann-bytes'),
+  annDup: el<HTMLTableCellElement>('ann-dup'),
   annEvents: el<HTMLTableCellElement>('ann-events'),
   docPut: el<HTMLButtonElement>('doc-put'),
   docTarget: el<HTMLSelectElement>('doc-target'),
@@ -659,13 +662,23 @@ const ANN_CENTRES = 200;
 const ANN_SEED = 20_000;
 const ANN_QUERIES = 50;
 let annBusy = false;
-const annBuildFacts = { flatMs: 0, graphMs: 0, built: false };
+const annBuildFacts = { flatMs: 0, graphMs: 0, built: false, dupRows: -1, data: 'clustered' };
+const COPIES = 20;
+const MANY_COPIES = 300;
 
 function annSetBusy(busy: boolean): void {
   annBusy = busy;
-  for (const b of [ui.annBuild, ui.annRun, ui.annCorrupt, ui.annReload, ui.annDelete])
+  for (const b of [
+    ui.annBuild,
+    ui.annRun,
+    ui.annCorrupt,
+    ui.annOldFormat,
+    ui.annReload,
+    ui.annDelete,
+  ])
     b.disabled = busy;
   ui.annKind.disabled = busy;
+  ui.annData.disabled = busy;
 }
 
 async function annRunGuarded(action: () => Promise<void>): Promise<void> {
@@ -702,17 +715,42 @@ function annQueries(): Float32Array[] {
   return Array.from({ length: ANN_QUERIES }, (_, j) => flat.slice(j * DIM, (j + 1) * DIM));
 }
 
-function* annRows(): Generator<{ key: string; vector: Float32Array }> {
+type AnnData = 'clustered' | 'copies' | 'many';
+const annDataKind = (): AnnData =>
+  ui.annData.value === 'copies' ? 'copies' : ui.annData.value === 'many' ? 'many' : 'clustered';
+
+/**
+ * The rows of the chosen data set, one at a time. 'clustered': 20,000 distinct rows. 'copies': 1,000 distinct
+ * vectors, each stored COPIES times under different keys (repeated boilerplate). 'many': 19,700 distinct rows and
+ * one vector stored MANY_COPIES times, a group larger than 2m (32 at m 16), so the graph is degenerate.
+ */
+function* annRows(kind: AnnData): Generator<{ key: string; vector: Float32Array }> {
   const stream = new ClusteredStream(
     clusteredCentres(ANN_SEED, ANN_CENTRES, DIM),
     DIM,
     ANN_SEED,
     'data',
   );
-  for (let i = 0; i < ANN_ROWS; i++) {
+  if (kind === 'copies') {
+    for (let g = 0; g < ANN_ROWS / COPIES; g++) {
+      const vector = new Float32Array(DIM);
+      stream.nextInto(vector);
+      for (let c = 0; c < COPIES; c++)
+        yield { key: synthKey(g * COPIES + c), vector: vector.slice() };
+    }
+    return;
+  }
+  const distinct = kind === 'many' ? ANN_ROWS - MANY_COPIES : ANN_ROWS;
+  for (let i = 0; i < distinct; i++) {
     const vector = new Float32Array(DIM);
     stream.nextInto(vector);
     yield { key: synthKey(i), vector };
+  }
+  if (kind === 'many') {
+    const one = new Float32Array(DIM);
+    stream.nextInto(one);
+    for (let c = 0; c < MANY_COPIES; c++)
+      yield { key: synthKey(distinct + c), vector: one.slice() };
   }
 }
 
@@ -722,12 +760,14 @@ const pct = (xs: number[], q: number): number => {
 };
 
 async function annBuild(): Promise<void> {
-  const s = await createStore({ driver: 'auto', events: eventSink });
+  const kind = annDataKind();
+  const seen: Event[] = [];
+  const s = await createStore({ driver: 'auto', events: annSink(seen) });
   try {
-    ui.annStatus.textContent = `[${stamp()}] building ${ANN_ROWS.toLocaleString('en-US')} rows and the graph on ${s.driver} (replaces the previous ones)...`;
+    ui.annStatus.textContent = `[${stamp()}] building ${ANN_ROWS.toLocaleString('en-US')} rows (${ui.annData.selectedOptions[0]?.textContent ?? kind}) and the graph on ${s.driver} (replaces the previous ones)...`;
     await s.clear(ANN_NS);
     let t0 = performance.now();
-    await s.putVectors(ANN_NS, annRows());
+    await s.putVectors(ANN_NS, annRows(kind));
     annBuildFacts.flatMs = performance.now() - t0;
     t0 = performance.now();
     const built = await s.buildIndex(ANN_NS, {
@@ -738,9 +778,13 @@ async function annBuild(): Promise<void> {
     });
     annBuildFacts.graphMs = performance.now() - t0;
     annBuildFacts.built = true;
+    annBuildFacts.data = kind;
+    const buildEvent = [...seen].reverse().find((e) => e.name === 'storage.index.build');
+    const dup = buildEvent?.attrs['duplicateRows'];
+    annBuildFacts.dupRows = typeof dup === 'number' ? dup : -1;
     ui.annStatus.textContent =
       `[${stamp()}] built ${built.liveRows.toLocaleString('en-US')} rows on ${s.driver}: flat write ${annBuildFacts.flatMs.toFixed(0)} ms, ` +
-      `graph ${annBuildFacts.graphMs.toFixed(0)} ms (${fmtBytes(built.bytes)}). Pick an index kind and press "Run 50 queries".`;
+      `graph ${annBuildFacts.graphMs.toFixed(0)} ms (${fmtBytes(built.bytes)}), exact duplicate rows ${annBuildFacts.dupRows < 0 ? 'not counted' : annBuildFacts.dupRows.toLocaleString('en-US')}. Pick an index kind and press "Run 50 queries".`;
   } finally {
     await s.close();
   }
@@ -760,14 +804,14 @@ async function annRunQueries(): Promise<void> {
     const qs = annQueries();
     const run = async (index: 'flat' | 'hnsw') => {
       const lat: number[] = [];
-      const keys: string[][] = [];
+      const scores: number[][] = [];
       for (const q of qs) {
         const t0 = performance.now();
         const hits = await s.query(ANN_NS, q, 10, { index, values: false });
         lat.push(performance.now() - t0);
-        keys.push(hits.map((h) => h.key));
+        scores.push(hits.map((h) => h.score));
       }
-      return { lat, keys };
+      return { lat, scores };
     };
     // One untimed query first so loading the vectors (and the graph) is not counted as a query.
     await s.query(ANN_NS, qs[0]!, 10, { index: kind, values: false });
@@ -777,12 +821,15 @@ async function annRunQueries(): Promise<void> {
     const fallback = String(last?.attrs['fallback'] ?? '');
     let recall = 1;
     if (kind === 'hnsw') {
-      const truth = (await run('flat')).keys;
+      // Copies of one vector tie, so recall is counted by score: a hit counts when its score is at least the flat
+      // scan's 10th best score for the same query.
+      const truth = (await run('flat')).scores;
       let sum = 0;
-      timed.keys.forEach((got, i) => {
-        sum += got.filter((k) => truth[i]!.includes(k)).length / Math.max(1, truth[i]!.length);
+      timed.scores.forEach((got, i) => {
+        const kth = truth[i]![truth[i]!.length - 1] ?? 0;
+        sum += got.filter((x) => x >= kth).length / Math.max(1, truth[i]!.length);
       });
-      recall = sum / timed.keys.length;
+      recall = sum / timed.scores.length;
     }
     const usage = await s.usage(ANN_NS);
     const refused = seen.find(
@@ -808,6 +855,10 @@ async function annRunQueries(): Promise<void> {
         ? `${recall.toFixed(3)} (1.000 means all of the exact top 10 for every query)`
         : '1.000 by definition: flat is the exact scan';
     ui.annBytes.textContent = `${fmtBytes(usage.annBytes ?? 0)} (${usage.annBytes ?? 0} bytes), ${fmtBytes(info.bytes)}`;
+    ui.annDup.textContent =
+      annBuildFacts.dupRows >= 0
+        ? `${annBuildFacts.dupRows.toLocaleString('en-US')} (this page load)`
+        : 'built in an earlier page load (press Build to count them again)';
     ui.annEvents.textContent =
       refused !== undefined
         ? `graph refused (reason ${String(refused.attrs['reason'])})` +
@@ -842,6 +893,44 @@ async function annCorrupt(): Promise<void> {
   }
 }
 
+/** CRC-32C (Castagnoli) of the bytes: the checksum the graph record ends with. */
+function crc32c(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const b of bytes) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) crc = crc & 1 ? (crc >>> 1) ^ 0x82f63b78 : crc >>> 1;
+  }
+  return ~crc >>> 0;
+}
+
+/** Rewrites the graph record of demo-ann as a file of the first format (magic LDHNSW01, version 1, CRC refreshed). */
+async function annOldFormat(): Promise<void> {
+  const s = await createStore({ driver: 'auto' });
+  const driverName = s.driver;
+  await s.close();
+  const d = driverName === 'opfs' ? new OpfsDriver() : new IndexedDbDriver();
+  await d.open();
+  try {
+    const rec = await d.getBytes(`${ANN_NS_PREFIX}${ANN_NS}`, 'graph');
+    if (!rec) {
+      ui.annStatus.textContent = `[${stamp()}] there is no graph to rewrite: press Build first.`;
+      return;
+    }
+    const out = rec.bytes.slice();
+    out.set(new TextEncoder().encode('LDHNSW01'), 0);
+    new DataView(out.buffer).setUint16(8, 1, true);
+    new DataView(out.buffer).setUint32(
+      out.length - 4,
+      crc32c(out.subarray(0, out.length - 4)),
+      true,
+    );
+    await d.put(`${ANN_NS_PREFIX}${ANN_NS}`, 'graph', out, { size: out.byteLength });
+    ui.annStatus.textContent = `[${stamp()}] rewrote the graph record of ${ANN_NS} on ${driverName} as a graph of the first format (LDHNSW01); the vectors are untouched. Pick hnsw and press "Run 50 queries": the SDK refuses it (reason version) and rebuilds it.`;
+  } finally {
+    await d.close();
+  }
+}
+
 async function annDelete(): Promise<void> {
   const s = await createStore({ driver: 'auto', events: eventSink });
   try {
@@ -859,6 +948,7 @@ function wireAnn(): void {
   ui.annBuild.addEventListener('click', () => void annRunGuarded(annBuild));
   ui.annRun.addEventListener('click', () => void annRunGuarded(annRunQueries));
   ui.annCorrupt.addEventListener('click', () => void annRunGuarded(annCorrupt));
+  ui.annOldFormat.addEventListener('click', () => void annRunGuarded(annOldFormat));
   ui.annReload.addEventListener('click', () => location.reload());
   ui.annDelete.addEventListener('click', () => void annRunGuarded(annDelete));
   if (!opfsAvailable() && !indexedDbAvailable()) {
